@@ -42,7 +42,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_backend.py",
       "snapshot_sha256": "361facedbc836412b3423eee3fea0261aeec01fdec3dc0ba061c7961ceaa7562",
       "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "7b9a4d4ddf140148f2bb2bc93fe604593125e9b9b8c1cf326eabe579e023a5f1"
+      "physical_blocks_sha256": "b5d7dac63866c4d64f722a9c08324568a1697d8260747dfffaa2022ba9f9a993"
     },
     {
       "logical_path": "server/gemma4_compat.py",

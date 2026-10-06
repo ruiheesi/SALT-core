@@ -196,6 +196,13 @@ RESERVED_PROMPT_TOKENS = (
     "<|channel>", "<channel|>", "<|think|>",
     IMAGE_BEGIN, IMAGE_TOKEN, IMAGE_END,
 )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+RESERVED_PROMPT_TOKENS += (
+    "<|tool>", "<tool|>", "<|tool_call>", "<tool_call|>",
+    "<|tool_response>", "<tool_response|>", "<|\"|>",
+)
+TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_PROMPT_BYTES = 4 * 1024 * 1024
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
@@ -335,12 +342,42 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+def _stream_visible_tool_content(value: str) -> str:
+    """Hide complete or partial native tool blocks from text deltas."""
+    opener = "<|tool_call>"
+    closer = "<tool_call|>"
+    response_boundary = "<|tool_response>"
+    visible: list[str] = []
+    offset = 0
+    while True:
+        start = value.find(opener, offset)
+        boundary = value.find(response_boundary, offset)
+        if boundary >= 0 and (start < 0 or boundary < start):
+            visible.append(value[offset:boundary])
+            break
+        if start < 0:
+            visible.append(value[offset:])
+            break
+        visible.append(value[offset:start])
+        finish = value.find(closer, start + len(opener))
+        if finish < 0:
+            break
+        offset = finish + len(closer)
+    return "".join(visible)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 class NativeStreamAccumulator:
     """Validate cumulative native frames and emit semantic text deltas."""
 
     _CONTROL_TOKENS = (
         "<|channel>thought", "<channel|>", "<turn|>", "<eos>",
     )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    _CONTROL_TOKENS += (
+        "<|tool_call>", "<tool_call|>",
+        "<|tool_response>", "<tool_response|>",
+    )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 
     def __init__(self, marker: str,
                  on_delta: Callable[[str, str], None],
@@ -367,6 +404,9 @@ class NativeStreamAccumulator:
         if hold:
             value = value[:-hold]
         reasoning, content = split_reasoning(value)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        content = _stream_visible_tool_content(content)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         return reasoning or "", content
 
     def feed_line(self, line: bytes) -> None:
@@ -2001,6 +2041,11 @@ class PersistentGemmaEngine:
         except UnicodeDecodeError as exc:
             raise BackendError("persistent V2 response is not UTF-8") from exc
         reasoning, content = split_reasoning(raw_response)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        reasoning, content, tool_calls = _parse_assistant_response(raw_response)
+        if tool_calls:
+            finish_reason = "tool_calls"
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         return RunnerResult(
             content=content, reasoning_content=reasoning,
             prompt_tokens=prompt_tokens, completion_tokens=output_steps,
@@ -2020,6 +2065,9 @@ class PersistentGemmaEngine:
             facts_rows=facts_rows, prompt_ids=prompt_ids,
             response_sha256=hashlib.sha256(response).hexdigest(),
             output_limit=output_limit,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+            tool_calls=tool_calls,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         )
 
     def stop(self, *, force: bool = False) -> None:
@@ -2170,6 +2218,22 @@ class RenderedChat:
     image_url: str | None
 
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 @dataclass(frozen=True)
 class PreparedImage:
     path: Path
@@ -2189,6 +2253,9 @@ class RunnerResult:
     response_bytes: int
     kv_loaded_tokens: int
     kv_saved_tokens: int
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    tool_calls: tuple[ToolCall, ...] = ()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     session_epoch: int = 0
     turn_id: int = 0
     history_turns: int = 0
@@ -2994,6 +3061,212 @@ def _client_text(value: str) -> str:
     return value.strip()
 
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+def _tool_text(value: object, label: str, *, allow_empty: bool = True) -> str:
+    if not isinstance(value, str):
+        raise RequestError(f"{label} must be a string")
+    if "\0" in value or any(token in value for token in RESERVED_PROMPT_TOKENS):
+        raise RequestError(f"{label} contains a reserved Gemma control token")
+    result = value.strip()
+    if not allow_empty and not result:
+        raise RequestError(f"{label} must not be empty")
+    return result
+
+
+def _tool_json_value(value: object, label: str, *, depth: int = 0) -> object:
+    if depth > 32:
+        raise RequestError(f"{label} exceeds maximum nesting depth")
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise RequestError(f"{label} contains a non-finite number")
+        return value
+    if isinstance(value, str):
+        return _tool_text(value, label)
+    if isinstance(value, list):
+        return [
+            _tool_json_value(item, f"{label}[{index}]", depth=depth + 1)
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            safe_key = _tool_text(key, f"{label} key", allow_empty=False)
+            result[safe_key] = _tool_json_value(
+                item, f"{label}.{safe_key}", depth=depth + 1,
+            )
+        return result
+    raise RequestError(f"{label} must contain only JSON values")
+
+
+def _normalize_tools(value: object) -> list[dict[str, object]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise RequestError("tools must be an array")
+    if len(value) > 128:
+        raise RequestError("at most 128 tools are accepted")
+    result: list[dict[str, object]] = []
+    names: set[str] = set()
+    for index, tool in enumerate(value):
+        if not isinstance(tool, dict) or set(tool) != {"type", "function"} or \
+                tool.get("type") != "function":
+            raise RequestError(f"tools[{index}] must be a function tool")
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise RequestError(f"tools[{index}].function must be an object")
+        unknown = set(function) - {
+            "name", "description", "parameters", "response", "strict",
+        }
+        if unknown:
+            raise RequestError(
+                f"unsupported tools[{index}].function fields: " +
+                ", ".join(sorted(unknown))
+            )
+        name = _tool_text(
+            function.get("name"), f"tools[{index}].function.name",
+            allow_empty=False,
+        )
+        if TOOL_NAME_RE.fullmatch(name) is None:
+            raise RequestError(f"tools[{index}].function.name is invalid")
+        if name in names:
+            raise RequestError(f"duplicate tool name: {name}")
+        names.add(name)
+        description = _tool_text(
+            function.get("description", ""),
+            f"tools[{index}].function.description",
+        )
+        parameters = _tool_json_value(
+            function.get("parameters", {"type": "object", "properties": {}}),
+            f"tools[{index}].function.parameters",
+        )
+        if not isinstance(parameters, dict):
+            raise RequestError(f"tools[{index}].function.parameters must be an object")
+        normalized: dict[str, object] = {
+            "name": name, "description": description,
+            "parameters": parameters,
+        }
+        if "response" in function:
+            response = _tool_json_value(
+                function["response"], f"tools[{index}].function.response",
+            )
+            if not isinstance(response, dict):
+                raise RequestError(f"tools[{index}].function.response must be an object")
+            normalized["response"] = response
+        strict = function.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise RequestError(f"tools[{index}].function.strict must be boolean")
+        result.append({"type": "function", "function": normalized})
+    return result
+
+
+def _normalize_tool_choice(value: object, tools: list[dict[str, object]]) -> object:
+    if value is None:
+        return "auto"
+    if value in ("auto", "none", "required"):
+        if value == "required" and not tools:
+            raise RequestError("tool_choice=required requires tools")
+        return value
+    if not isinstance(value, dict) or set(value) != {"type", "function"} or \
+            value.get("type") != "function":
+        raise RequestError("tool_choice must be auto, none, required, or a function")
+    function = value.get("function")
+    if not isinstance(function, dict) or set(function) != {"name"}:
+        raise RequestError("tool_choice.function requires only name")
+    name = _tool_text(
+        function.get("name"), "tool_choice.function.name", allow_empty=False,
+    )
+    if name not in {
+            cast(dict[str, object], tool["function"])["name"] for tool in tools}:
+        raise RequestError("tool_choice names an unavailable function")
+    return {"type": "function", "function": {"name": name}}
+
+
+def _request_uses_tools(body: dict) -> bool:
+    tools = body.get("tools")
+    if isinstance(tools, list) and bool(tools):
+        return True
+    messages = body.get("messages")
+    return isinstance(messages, list) and any(
+        isinstance(message, dict) and (
+            message.get("role") == "tool" or
+            message.get("tool_calls") is not None
+        )
+        for message in messages
+    )
+
+
+def _gemma_quote(value: str) -> str:
+    return "<|\"|>" + value + "<|\"|>"
+
+
+def _gemma_tool_value(value: object, *, key: str | None = None) -> str:
+    if isinstance(value, str):
+        if key == "type":
+            value = value.upper()
+        return _gemma_quote(value)
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value, allow_nan=False)
+    if isinstance(value, list):
+        items = [
+            _gemma_tool_value(
+                item.upper() if key == "type" and isinstance(item, str) else item,
+            )
+            for item in value
+        ]
+        return "[" + ",".join(items) + "]"
+    if isinstance(value, dict):
+        fields: list[str] = []
+        for field in sorted(value):
+            field_text = (
+                field if TOOL_NAME_RE.fullmatch(field) is not None
+                else _gemma_quote(field)
+            )
+            fields.append(
+                field_text + ":" + _gemma_tool_value(value[field], key=field)
+            )
+        return "{" + ",".join(fields) + "}"
+    raise BackendError("validated tool schema contains a non-JSON value")
+
+
+def _tool_prompt_parts(tools: list[dict[str, object]],
+                       tool_choice: object) -> tuple[list[str], str | None]:
+    selected = tools
+    instruction: str | None = None
+    if tool_choice == "none":
+        selected = []
+    elif tool_choice == "required":
+        instruction = "You must call one or more provided tools before answering."
+    elif isinstance(tool_choice, dict):
+        name = cast(dict[str, str], tool_choice["function"])["name"]
+        selected = [
+            tool for tool in tools
+            if cast(dict[str, object], tool["function"])["name"] == name
+        ]
+        instruction = f"You must call the {name} tool before answering."
+    rendered: list[str] = []
+    for tool in selected:
+        function = cast(dict[str, object], tool["function"])
+        declaration = (
+            "declaration:" + cast(str, function["name"]) +
+            "{description:" + _gemma_quote(cast(str, function["description"])) +
+            ",parameters:" + _gemma_tool_value(function["parameters"])
+        )
+        if "response" in function:
+            declaration += ",response:" + _gemma_tool_value(function["response"])
+        declaration += "}"
+        rendered.append("<|tool>" + declaration + "<tool|>")
+    return rendered, instruction
+
+
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 def _text_and_image_parts(content: object, role: str) -> tuple[str, str | None]:
     if isinstance(content, str):
         return _client_text(content), None
@@ -3135,6 +3408,264 @@ def render_chat(messages: object, *, enable_thinking: bool,
     return RenderedChat(prompt=prompt, image_url=image_url)
 
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+def _message_tool_calls(value: object, label: str) -> list[dict[str, object]]:
+    if not isinstance(value, list) or not value:
+        raise RequestError(f"{label} must be a nonempty array")
+    result: list[dict[str, object]] = []
+    ids: set[str] = set()
+    for index, call in enumerate(value):
+        if not isinstance(call, dict):
+            raise RequestError(f"{label}[{index}] must be an object")
+        unknown = set(call) - {"id", "type", "function"}
+        if unknown or call.get("type", "function") != "function":
+            raise RequestError(f"{label}[{index}] must be a function call")
+        call_id = _tool_text(
+            call.get("id"), f"{label}[{index}].id", allow_empty=False,
+        )
+        if len(call_id) > 128 or call_id in ids:
+            raise RequestError(f"{label}[{index}].id is invalid or duplicate")
+        ids.add(call_id)
+        function = call.get("function")
+        if not isinstance(function, dict) or \
+                set(function) != {"name", "arguments"}:
+            raise RequestError(
+                f"{label}[{index}].function requires name and arguments"
+            )
+        name = _tool_text(
+            function.get("name"), f"{label}[{index}].function.name",
+            allow_empty=False,
+        )
+        if TOOL_NAME_RE.fullmatch(name) is None:
+            raise RequestError(f"{label}[{index}].function.name is invalid")
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise RequestError(
+                    f"{label}[{index}].function.arguments must be valid JSON"
+                ) from exc
+        arguments = _tool_json_value(
+            arguments, f"{label}[{index}].function.arguments",
+        )
+        if not isinstance(arguments, dict):
+            raise RequestError(
+                f"{label}[{index}].function.arguments must be an object"
+            )
+        result.append({"id": call_id, "name": name, "arguments": arguments})
+    return result
+
+
+def _render_message_tool_call(call: dict[str, object]) -> str:
+    arguments = cast(dict[str, object], call["arguments"])
+    body = ",".join(
+        key + ":" + _gemma_tool_value(arguments[key])
+        for key in sorted(arguments)
+    )
+    return (
+        "<|tool_call>call:" + cast(str, call["name"]) +
+        "{" + body + "}<tool_call|>"
+    )
+
+
+def _render_tool_response(name: str, value: str) -> str:
+    return (
+        "<|tool_response>response:" + name +
+        "{value:" + _gemma_quote(value) + "}<tool_response|>"
+    )
+
+
+def render_chat(messages: object, *, enable_thinking: bool,
+                continuation: bool = False, tools: object = None,
+                tool_choice: object = None) -> RenderedChat:
+    """Render a full Gemma chat or one user-turn continuation."""
+    if not isinstance(messages, list) or not messages:
+        raise RequestError("messages required")
+    normalized_tools = _normalize_tools(tools)
+    normalized_choice = _normalize_tool_choice(tool_choice, normalized_tools)
+    if continuation:
+        if normalized_tools or normalized_choice not in ("auto", "none"):
+            raise RequestError("cache continuation does not support tools")
+        if len(messages) != 1 or not isinstance(messages[0], dict) or \
+                messages[0].get("role") != "user":
+            raise RequestError("cache continuation must contain exactly one user message")
+        text, image_url = _text_and_image_parts(
+            messages[0].get("content", ""), "user",
+        )
+        if image_url is not None:
+            raise RequestError("cache continuations cannot add an image")
+        if not text:
+            raise RequestError("cache continuation user message has no supported content")
+        chunks = ["\n<|turn>user\n", text, "<turn|>\n<|turn>model\n"]
+        if not enable_thinking:
+            chunks.append("<|channel>thought\n<channel|>")
+        prompt = "".join(chunks)
+        if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+            raise RequestError("rendered prompt exceeds 64 KiB")
+        return RenderedChat(prompt=prompt, image_url=None)
+    if len(messages) > 64:
+        raise RequestError("at most 64 messages are accepted")
+
+    system_parts: list[str] = []
+    image_url: str | None = None
+    seen_non_system = False
+    body_chunks: list[str] = []
+    pending_calls: dict[str, str] | None = None
+    answered_calls: set[str] = set()
+    last_kind: str | None = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise RequestError("messages must be objects")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise RequestError(f"unsupported message role: {role!r}")
+        if role in ("system", "developer"):
+            unknown = set(message) - {"role", "content"}
+            if unknown:
+                raise RequestError(
+                    "unsupported message fields: " + ", ".join(sorted(unknown))
+                )
+            if seen_non_system:
+                raise RequestError("system/developer messages must precede chat turns")
+            text, found_image = _text_and_image_parts(message.get("content", ""), role)
+            if found_image is not None:
+                raise RequestError("system/developer messages cannot contain images")
+            if text:
+                system_parts.append(text)
+            continue
+        seen_non_system = True
+        if role == "tool":
+            unknown = set(message) - {"role", "content", "tool_call_id", "name"}
+            if unknown:
+                raise RequestError(
+                    "unsupported message fields: " + ", ".join(sorted(unknown))
+                )
+            if pending_calls is None:
+                raise RequestError("tool message does not follow assistant tool_calls")
+            call_id = _tool_text(
+                message.get("tool_call_id"), f"message {index} tool_call_id",
+                allow_empty=False,
+            )
+            if call_id not in pending_calls or call_id in answered_calls:
+                raise RequestError("tool message has an unknown or duplicate tool_call_id")
+            text, found_image = _text_and_image_parts(
+                message.get("content", ""), "tool",
+            )
+            if found_image is not None:
+                raise RequestError("tool messages cannot contain images")
+            body_chunks.append(_render_tool_response(pending_calls[call_id], text))
+            answered_calls.add(call_id)
+            last_kind = "tool_response"
+            continue
+        if pending_calls is not None:
+            if answered_calls != set(pending_calls):
+                raise RequestError("assistant tool_calls require matching tool messages")
+            if role != "assistant":
+                raise RequestError("tool responses must be followed by an assistant message")
+            pending_calls = None
+            answered_calls = set()
+        if role == "user":
+            unknown = set(message) - {"role", "content"}
+            if unknown:
+                raise RequestError(
+                    "unsupported message fields: " + ", ".join(sorted(unknown))
+                )
+            text, found_image = _text_and_image_parts(
+                message.get("content", ""), role,
+            )
+            if found_image is not None:
+                if image_url is not None:
+                    raise RequestError("Gemma 4 supports exactly one image per request")
+                image_url = found_image
+            if not text:
+                raise RequestError(f"message {index} has no supported content")
+            body_chunks.extend(("<|turn>user\n", text, "<turn|>\n"))
+            last_kind = "user"
+            continue
+        unknown = set(message) - {
+            "role", "content", "reasoning_content", "reasoning", "tool_calls",
+            "refusal",
+        }
+        if unknown:
+            raise RequestError(
+                "unsupported message fields: " + ", ".join(sorted(unknown))
+            )
+        raw_content = message.get("content")
+        if raw_content is None:
+            text, found_image = "", None
+        else:
+            text, found_image = _text_and_image_parts(raw_content, role)
+        if found_image is not None:
+            raise RequestError("assistant messages cannot contain images")
+        raw_calls = message.get("tool_calls")
+        calls = (
+            _message_tool_calls(raw_calls, f"message {index} tool_calls")
+            if raw_calls is not None else []
+        )
+        if not text and not calls:
+            raise RequestError(f"message {index} has no supported content")
+        continuing_tool_turn = last_kind == "tool_response"
+        if not continuing_tool_turn:
+            body_chunks.append("<|turn>model\n")
+        reasoning_value = message.get("reasoning_content", message.get("reasoning"))
+        if reasoning_value is not None and calls:
+            reasoning = _tool_text(reasoning_value, f"message {index} reasoning")
+            if reasoning:
+                body_chunks.append(
+                    "<|channel>thought\n" + reasoning + "\n<channel|>"
+                )
+        if calls:
+            body_chunks.extend(_render_message_tool_call(call) for call in calls)
+            pending_calls = {
+                cast(str, call["id"]): cast(str, call["name"]) for call in calls
+            }
+            answered_calls = set()
+            last_kind = "tool_call"
+        if text:
+            body_chunks.append(text)
+        if not calls:
+            body_chunks.append("<turn|>\n")
+            last_kind = "assistant"
+
+    if pending_calls is not None:
+        if answered_calls != set(pending_calls):
+            raise RequestError("assistant tool_calls require matching tool messages")
+        last_kind = "tool_response"
+    if last_kind not in ("user", "tool_response"):
+        raise RequestError("the final chat message must be from the user or a tool")
+
+    chunks = ["<bos>"]
+    tool_parts, choice_instruction = _tool_prompt_parts(
+        normalized_tools, normalized_choice,
+    )
+    if choice_instruction is not None:
+        system_parts.append(choice_instruction)
+    if system_parts or enable_thinking or tool_parts:
+        chunks.append("<|turn>system\n")
+        if enable_thinking:
+            chunks.append("<|think|>\n")
+        if system_parts:
+            chunks.append("\n".join(system_parts))
+        chunks.extend(tool_parts)
+        chunks.append("<turn|>\n")
+    chunks.extend(body_chunks)
+    if last_kind == "user":
+        chunks.append("<|turn>model\n")
+        if not enable_thinking:
+            chunks.append("<|channel>thought\n<channel|>")
+    elif last_kind == "tool_response" and not enable_thinking:
+        chunks.append("<|channel>thought\n<channel|>")
+    prompt = "".join(chunks)
+    expected_image_tokens = IMAGE_SOFT_TOKENS if image_url is not None else 0
+    if prompt.count(IMAGE_TOKEN) != expected_image_tokens:
+        raise BackendError("rendered image placeholder count drift")
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise RequestError("rendered prompt exceeds 64 KiB")
+    return RenderedChat(prompt=prompt, image_url=image_url)
+
+
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 def _ppm_token(data: bytes, offset: int) -> tuple[bytes, int]:
     size = len(data)
     while offset < size:
@@ -3341,6 +3872,162 @@ def split_reasoning(response: str) -> tuple[str | None, str]:
     return reasoning, value.strip()
 
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+class _GemmaToolValueParser:
+    """Parse Gemma's compact tool-value format into ordinary JSON values."""
+
+    def __init__(self, value: str):
+        self.value = value
+        self.position = 0
+
+    def _skip_space(self) -> None:
+        while self.position < len(self.value) and \
+                self.value[self.position].isspace():
+            self.position += 1
+
+    def _quoted(self) -> str:
+        delimiter = '<|"|>'
+        if not self.value.startswith(delimiter, self.position):
+            raise BackendError("Gemma tool call contains an invalid quoted value")
+        self.position += len(delimiter)
+        finish = self.value.find(delimiter, self.position)
+        if finish < 0:
+            raise BackendError("Gemma tool call has an unterminated quoted value")
+        result = self.value[self.position:finish]
+        self.position = finish + len(delimiter)
+        return result
+
+    def _bare(self, *, key: bool = False) -> object:
+        start = self.position
+        while self.position < len(self.value) and \
+                self.value[self.position] not in ",:{}[]" and \
+                not self.value[self.position].isspace():
+            self.position += 1
+        token = self.value[start:self.position]
+        if not token:
+            raise BackendError("Gemma tool call contains an empty token")
+        if key:
+            return token
+        if token == "true":
+            return True
+        if token == "false":
+            return False
+        if token == "null":
+            return None
+        if re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?", token):
+            try:
+                return json.loads(token)
+            except json.JSONDecodeError as exc:
+                raise BackendError("Gemma tool call contains an invalid number") from exc
+        # Models occasionally emit enum-like bare atoms. Preserve them as JSON
+        # strings rather than losing an otherwise usable function call.
+        return token
+
+    def parse(self, *, depth: int = 0) -> object:
+        if depth > 32:
+            raise BackendError("Gemma tool call exceeds maximum nesting depth")
+        self._skip_space()
+        if self.position >= len(self.value):
+            raise BackendError("Gemma tool call contains a missing value")
+        if self.value.startswith('<|"|>', self.position):
+            return self._quoted()
+        current = self.value[self.position]
+        if current == "{":
+            self.position += 1
+            result: dict[str, object] = {}
+            self._skip_space()
+            if self.position < len(self.value) and self.value[self.position] == "}":
+                self.position += 1
+                return result
+            while True:
+                self._skip_space()
+                parsed_key = (
+                    self._quoted()
+                    if self.value.startswith('<|"|>', self.position)
+                    else self._bare(key=True)
+                )
+                assert isinstance(parsed_key, str)
+                self._skip_space()
+                if self.position >= len(self.value) or \
+                        self.value[self.position] != ":":
+                    raise BackendError("Gemma tool call object is missing ':'")
+                self.position += 1
+                if parsed_key in result:
+                    raise BackendError("Gemma tool call contains a duplicate argument")
+                result[parsed_key] = self.parse(depth=depth + 1)
+                self._skip_space()
+                if self.position >= len(self.value):
+                    raise BackendError("Gemma tool call object is unterminated")
+                separator = self.value[self.position]
+                self.position += 1
+                if separator == "}":
+                    return result
+                if separator != ",":
+                    raise BackendError("Gemma tool call object has invalid punctuation")
+        if current == "[":
+            self.position += 1
+            result_list: list[object] = []
+            self._skip_space()
+            if self.position < len(self.value) and self.value[self.position] == "]":
+                self.position += 1
+                return result_list
+            while True:
+                result_list.append(self.parse(depth=depth + 1))
+                self._skip_space()
+                if self.position >= len(self.value):
+                    raise BackendError("Gemma tool call array is unterminated")
+                separator = self.value[self.position]
+                self.position += 1
+                if separator == "]":
+                    return result_list
+                if separator != ",":
+                    raise BackendError("Gemma tool call array has invalid punctuation")
+        return self._bare()
+
+
+def _parse_tool_call_block(block: str, index: int) -> ToolCall:
+    match = re.fullmatch(r"\s*call:([A-Za-z0-9_.:-]{1,128})(\{.*\})\s*", block,
+                         flags=re.DOTALL)
+    if match is None:
+        raise BackendError("Gemma emitted a malformed tool call")
+    parser = _GemmaToolValueParser(match.group(2))
+    arguments = parser.parse()
+    parser._skip_space()
+    if parser.position != len(parser.value) or not isinstance(arguments, dict):
+        raise BackendError("Gemma emitted malformed tool-call arguments")
+    encoded = json.dumps(
+        arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
+    digest = hashlib.sha256(
+        (str(index) + "\0" + block).encode("utf-8")
+    ).hexdigest()[:24]
+    return ToolCall(id="call_" + digest, name=match.group(1), arguments=encoded)
+
+
+def _parse_assistant_response(
+        response: str) -> tuple[str | None, str, tuple[ToolCall, ...]]:
+    reasoning, value = split_reasoning(response)
+    pattern = re.compile(r"<\|tool_call>(.*?)<tool_call\|>", re.DOTALL)
+    calls: list[ToolCall] = []
+    content_parts: list[str] = []
+    offset = 0
+    for index, match in enumerate(pattern.finditer(value)):
+        content_parts.append(value[offset:match.start()])
+        calls.append(_parse_tool_call_block(match.group(1), index))
+        offset = match.end()
+    content_parts.append(value[offset:])
+    content = "".join(content_parts).strip()
+    forbidden = (
+        "<|tool_call>", "<tool_call|>",
+        "<|tool_response>", "<tool_response|>",
+    )
+    if any(token in content for token in forbidden):
+        raise BackendError("Gemma emitted malformed tool-control framing")
+    return reasoning, content, tuple(calls)
+
+
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 def parse_runner_output(stdout: bytes, stderr: bytes, modality: str,
                         generation_cap: int) -> RunnerResult:
     if modality not in ("text", "image"):
@@ -3391,6 +4078,11 @@ def parse_runner_output(stdout: bytes, stderr: bytes, modality: str,
     trailer = b"runtime_ready=true\n" if modality == "image" else b""
     response = _response_block(stdout, marker, response_bytes, trailer)
     reasoning, content = split_reasoning(response)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    reasoning, content, tool_calls = _parse_assistant_response(response)
+    if tool_calls:
+        finish_reason = "tool_calls"
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     return RunnerResult(
         content=content,
         reasoning_content=reasoning,
@@ -3402,6 +4094,9 @@ def parse_runner_output(stdout: bytes, stderr: bytes, modality: str,
         response_bytes=response_bytes,
         kv_loaded_tokens=kv_loaded_tokens,
         kv_saved_tokens=kv_saved_tokens,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        tool_calls=tool_calls,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     )
 
 
@@ -4293,6 +4988,10 @@ class Gemma4Backend:
             "image_contract": "one canonical no-resize P6 PPM",
             "reasoning_efforts": list(EFFORT_OUTPUT),
             "reasoning_trace_field": "reasoning_content",
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+            "tool_calling": True,
+            "tool_call_format": "gemma4-native",
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             "decode": "greedy",
             "streaming": "live-sse",
             "sessions": "one-live-kv-session-per-launch",
@@ -4412,6 +5111,9 @@ class Gemma4Backend:
                 "messages", "max_tokens", "max_completion_tokens",
                 "reasoning_effort", "modalities", "audio", "response_format",
                 "stream_options",
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                "tool_choice",
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             }
             label = "Chat"
             required = "messages"
@@ -4428,6 +5130,10 @@ class Gemma4Backend:
             )
         if required not in body:
             raise RequestError(f"{label} request requires {required}")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        if endpoint == "responses" and body.get("tools") not in (None, []):
+            raise RequestError("Responses API tool calls are not supported")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         model = body.get("model")
         if model is not None and not isinstance(model, str):
             raise RequestError("model must be a string")
@@ -4506,6 +5212,12 @@ class Gemma4Backend:
         logprobs = body.get("logprobs")
         if logprobs is not None and logprobs is not False:
             raise RequestError("logprobs must be boolean false")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        tools = _normalize_tools(body.get("tools"))
+        _normalize_tool_choice(body.get("tool_choice"), tools)
+        body = dict(body)
+        body["tools"] = []
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         tools = body.get("tools")
         if tools is not None and (not isinstance(tools, list) or tools):
             raise RequestError("Gemma 4 tool calls are not server-qualified")
@@ -4535,6 +5247,9 @@ class Gemma4Backend:
             body.get("messages"),
             enable_thinking=controls.enable_thinking,
             continuation=selection.load_path is not None,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+            tools=body.get("tools"), tool_choice=body.get("tool_choice"),
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         )
         modality = "image" if rendered.image_url is not None else "text"
         image_context = (
@@ -4673,6 +5388,115 @@ class Gemma4Backend:
         if len(self.transport_records) > 256:
             self.transport_records.popitem(last=False)
         return value
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    def _complete_tool_request(
+            self, request_body: dict, controls: Controls, *,
+            client_request_sha256: str, request_sha256: str,
+            strict_proof: bool, started: Callable[[], None],
+            delta: Callable[[str, str], None],
+            on_native_token: Callable[[int, int, bool], None] | None,
+            t0: float,
+    ) -> Completion:
+        if self.engine is None:
+            raise BackendError("persistent Gemma engine has not started")
+        if self.history_turns > 0:
+            transport_identity = self.transport_records.get(
+                client_request_sha256,
+            )
+            self.clear_facts()
+            if transport_identity is not None:
+                self.transport_records[client_request_sha256] = transport_identity
+        rendered = render_chat(
+            request_body.get("messages"),
+            enable_thinking=controls.enable_thinking,
+            continuation=False,
+            tools=request_body.get("tools"),
+            tool_choice=request_body.get("tool_choice"),
+        )
+        if rendered.image_url is not None and self.session_position > 0:
+            raise RequestError(
+                "images are supported only on the first persistent turn"
+            )
+        image_context = (
+            prepared_image(rendered.image_url, self.config.image_root)
+            if rendered.image_url is not None else nullcontext(None)
+        )
+        with image_context as image:
+            self.engine.sampler_abi = controls.sampler_abi_id
+            self.engine.temperature_bits = controls.temperature_bits
+            self.engine.sampler_seed = controls.seed
+            self.engine.sampler_top_k = controls.top_k
+            result = self.engine.request(
+                rendered.prompt, image.path if image is not None else None,
+                expected_epoch=self.session_epoch,
+                expected_turn=self.turn_count,
+                expected_history_turns=self.history_turns,
+                expected_position=self.session_position,
+                client_request_sha256=client_request_sha256,
+                request_sha256=request_sha256,
+                output_limit=controls.output_tokens,
+                on_start=started, on_delta=delta,
+                on_token=on_native_token,
+                proof_state=strict_proof,
+            )
+        if result.replayed:
+            self._remember_committed_request(
+                result.client_request_sha256, result.request_sha256,
+            )
+            return Completion(
+                result=result, controls=controls,
+                modality="image" if result.image_tokens else "text",
+                elapsed_s=time.monotonic() - t0,
+                kv_cache=KVCacheOutcome(
+                    mode="live-replay", cache_id="launch",
+                    loaded_tokens=result.kv_loaded_tokens,
+                    saved_tokens=result.kv_saved_tokens,
+                ),
+                mentor_state=self._mentor_public(),
+            )
+        if result.kv_loaded_tokens != self.session_position:
+            raise BackendError("persistent live-KV start position drift")
+        if (result.session_epoch != self.session_epoch or
+                result.turn_id != self.turn_count + 1 or
+                result.history_turns != self.history_turns + 1 or
+                not result.session_continuable):
+            raise BackendError("persistent native COMMIT authority drift")
+        self.session_epoch = result.session_epoch
+        self.turn_count = result.turn_id
+        self.history_turns = result.history_turns
+        self.session_position = result.kv_saved_tokens
+        self.state_sha256 = result.state_sha256
+        self.facts_sha256 = result.facts_sha256
+        self.mindset_mode = result.mindset_mode
+        self.mindset_end = result.mindset_end
+        self.mindset_sha256 = result.mindset_sha256
+        self.facts_rows = result.facts_rows
+        self.session_history = []
+        self.session_turns.append({
+            "turn_id": result.turn_id,
+            "prompt_ids": list(result.prompt_ids),
+            "output_ids": list(result.output_ids),
+            "response_sha256": result.response_sha256,
+            "content": result.content,
+            "tool_calls": [call.as_dict() for call in result.tool_calls],
+            "output_limit": controls.output_tokens,
+        })
+        self.last_user_signature = None
+        self._remember_committed_request(
+            client_request_sha256, request_sha256,
+        )
+        return Completion(
+            result=result, controls=controls,
+            modality="image" if rendered.image_url is not None else "text",
+            elapsed_s=time.monotonic() - t0,
+            kv_cache=KVCacheOutcome(
+                mode="live", cache_id="launch",
+                loaded_tokens=result.kv_loaded_tokens,
+                saved_tokens=result.kv_saved_tokens,
+            ),
+            mentor_state=self._mentor_public(),
+        )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 
     def complete(
             self, body: dict, *, endpoint: str = "chat",
@@ -4687,6 +5511,9 @@ class Gemma4Backend:
         request_body = dict(body)
         if endpoint == "responses":
             request_body["messages"] = _responses_messages(body)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        tool_mode = endpoint == "chat" and _request_uses_tools(request_body)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         model = request_body.get("model")
         if model is not None and model != self.config.model_id:
             raise RequestError(
@@ -4741,6 +5568,16 @@ class Gemma4Backend:
                 ),
                 mentor_state=self._mentor_public(),
             )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        if tool_mode:
+            return self._complete_tool_request(
+                request_body, controls,
+                client_request_sha256=client_request_sha256,
+                request_sha256=request_sha256,
+                strict_proof=strict_proof, started=started, delta=delta,
+                on_native_token=on_native_token, t0=t0,
+            )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         incoming_messages = request_body.get("messages")
         incoming_signature = self._history_signature(incoming_messages)
         history_after_user: list[tuple[str, str, str | None]]
@@ -4891,6 +5728,11 @@ def _chat_payload(completion: Completion, *, model: str,
     message = {"role": "assistant", "content": result.content}
     if result.reasoning_content is not None:
         message["reasoning_content"] = result.reasoning_content
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    if result.tool_calls:
+        message["content"] = result.content or None
+        message["tool_calls"] = [call.as_dict() for call in result.tool_calls]
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     payload = {
         "id": completion_id,
         "object": "chat.completion",
@@ -5350,6 +6192,14 @@ def handler_for(backend: Gemma4Backend):
                     backend.lock.release()
                     raise
                 stream_requested = body.get("stream") is True
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                buffered_tool_stream = (
+                    stream_requested and not responses_api and
+                    _request_uses_tools(body)
+                )
+                requested_stream_transport = stream_requested
+                stream_requested = stream_requested and not buffered_tool_stream
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 completion_id = "chatcmpl-" + unique
                 response_id = "resp_" + unique
                 item_id = "msg_" + unique
@@ -5394,7 +6244,14 @@ def handler_for(backend: Gemma4Backend):
                     )
                 finally:
                     backend.lock.release()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                stream_requested = requested_stream_transport
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 if stream_requested:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                    if buffered_tool_stream:
+                        start_stream()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     if client_disconnected:
                         return
                     if responses_api:
@@ -5402,6 +6259,12 @@ def handler_for(backend: Gemma4Backend):
                             completion, response_id, created,
                         )
                     else:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                        if buffered_tool_stream:
+                            self._stream_buffered_chat_result(
+                                completion, completion_id, created,
+                            )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                         stream_options = body.get("stream_options") or {}
                         include_usage = stream_options.get("include_usage", True)
                         self._finish_chat_stream(
@@ -5513,6 +6376,30 @@ def handler_for(backend: Gemma4Backend):
             self._write_sse(self._chat_chunk(
                 completion_id, created, {key: value},
             ))
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        def _stream_buffered_chat_result(
+                self, completion: Completion,
+                completion_id: str, created: int) -> None:
+            result = completion.result
+            if result.reasoning_content:
+                self._stream_chat_delta(
+                    completion_id, created,
+                    "reasoning_content", result.reasoning_content,
+                )
+            if result.content:
+                self._stream_chat_delta(
+                    completion_id, created, "content", result.content,
+                )
+            for index, call in enumerate(result.tool_calls):
+                self._write_sse(self._chat_chunk(
+                    completion_id, created, {
+                        "tool_calls": [{
+                            "index": index,
+                            **call.as_dict(),
+                        }],
+                    },
+                ))
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 
         def _finish_chat_stream(
                 self, completion: Completion, completion_id: str, created: int,

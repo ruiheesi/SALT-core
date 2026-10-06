@@ -313,13 +313,48 @@ def main() -> None:
         ),
         "include_usage must be a boolean",
     )
-    for field in ("tool_choice", "logit_bias"):
-        expect_request_error(
-            lambda field=field: module.Gemma4Backend._validate_request_schema(
-                {"messages": [], field: {}}, endpoint="chat",
-            ),
-            "unsupported Chat fields",
-        )
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }]
+    module.Gemma4Backend._validate_request_schema({
+        "messages": [], "tools": tools, "tool_choice": "auto",
+    }, endpoint="chat")
+    module.Gemma4Backend._validate_request_schema({
+        "messages": [], "tools": tools,
+        "tool_choice": {
+            "type": "function", "function": {"name": "get_weather"},
+        },
+    }, endpoint="chat")
+    expect_request_error(
+        lambda: module.Gemma4Backend._validate_request_schema({
+            "messages": [], "tools": tools,
+            "tool_choice": {
+                "type": "function", "function": {"name": "missing"},
+            },
+        }, endpoint="chat"),
+        "unavailable function",
+    )
+    expect_request_error(
+        lambda: module.Gemma4Backend._validate_request_schema(
+            {"messages": [], "logit_bias": {}}, endpoint="chat",
+        ),
+        "unsupported Chat fields",
+    )
+    expect_request_error(
+        lambda: module.Gemma4Backend._validate_request_schema(
+            {"input": "x", "tools": tools}, endpoint="responses",
+        ),
+        "Responses API tool calls",
+    )
     expect_request_error(
         lambda: module.Gemma4Backend._validate_request_schema(
             {"input": "x", "text": {"format": {"type": "json_schema"}}},
@@ -432,6 +467,46 @@ def main() -> None:
         "unsupported message fields",
     )
 
+    tool_prompt = module.render_chat(
+        [{"role": "user", "content": "What is the weather in Boston?"}],
+        enable_thinking=False, tools=tools, tool_choice="required",
+    )
+    assert "<|tool>declaration:get_weather{" in tool_prompt.prompt
+    assert "type:<|\"|>OBJECT<|\"|>" in tool_prompt.prompt
+    assert "You must call one or more provided tools" in tool_prompt.prompt
+    assert tool_prompt.prompt.endswith(
+        "<|turn>model\n<|channel>thought\n<channel|>"
+    )
+
+    tool_followup = module.render_chat([
+        {"role": "user", "content": "What is the weather in Boston?"},
+        {
+            "role": "assistant", "content": None,
+            "tool_calls": [{
+                "id": "call_test", "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city":"Boston"}',
+                },
+            }],
+        },
+        {
+            "role": "tool", "tool_call_id": "call_test",
+            "content": "72 F and sunny",
+        },
+    ], enable_thinking=False, tools=tools)
+    assert (
+        '<|tool_call>call:get_weather{city:<|"|>Boston<|"|>}<tool_call|>'
+        in tool_followup.prompt
+    )
+    assert (
+        '<|tool_response>response:get_weather{value:<|"|>72 F and sunny<|"|>}'
+        '<tool_response|>' in tool_followup.prompt
+    )
+    assert tool_followup.prompt.endswith(
+        "<tool_response|><|channel>thought\n<channel|>"
+    )
+
     thought = module.render_chat([
         {"role": "system", "content": "Be exact."},
         {"role": "user", "content": "2+2?"},
@@ -508,6 +583,30 @@ def main() -> None:
     assert direct.completion_tokens == 2
     assert direct.finish_reason == "stop"
 
+    tool_result = runner_fixture(
+        "text",
+        '<|tool_call>call:get_weather{city:<|"|>Boston<|"|>,days:2}'
+        '<tool_call|>',
+        output_ids=(48, 818, 49, 50), stop_token=50,
+    )
+    assert tool_result.finish_reason == "tool_calls"
+    assert tool_result.content == ""
+    assert len(tool_result.tool_calls) == 1
+    assert tool_result.tool_calls[0].name == "get_weather"
+    assert tool_result.tool_calls[0].arguments == '{"city":"Boston","days":2}'
+    assert tool_result.tool_calls[0].id.startswith("call_")
+    streamed_deltas: list[tuple[str, str]] = []
+    accumulator = module.NativeV2Accumulator(
+        lambda kind, value: streamed_deltas.append((kind, value)),
+    )
+    streamed_call = '<|tool_call>call:get_weather{city:<|"|>Boston<|"|>,days:2}'
+    accumulator.feed(1, 48, 0, b"<|tool_call>")
+    accumulator.feed(2, 818, 0, streamed_call.encode("utf-8"))
+    accumulator.feed(3, 49, 0, (streamed_call + "<tool_call|>").encode("utf-8"))
+    accumulator.feed(4, 50, 1, (streamed_call + "<tool_call|>").encode("utf-8"))
+    accumulator.finish(tool_result)
+    assert streamed_deltas == []
+
     traced = runner_fixture(
         "text", "<|channel>thought\nAdd two pairs.\n<channel|>Four.",
         output_ids=tuple(range(50)), cap=50, stop_token=-1,
@@ -569,6 +668,24 @@ def main() -> None:
         "temperature": 0.0, "temperature_bits": "00000000",
         "seed": None, "top_k": 1, "rng_abi": "none", "rng_draw_count": 0,
     }
+
+    tool_completion = module.Completion(
+        result=tool_result, controls=completion.controls,
+        modality="text", elapsed_s=0.0,
+        kv_cache=module.KVCacheOutcome("none", None, 0, 0),
+    )
+    tool_payload = module._chat_payload(
+        tool_completion, model=module.DEFAULT_MODEL_ID,
+        completion_id="chatcmpl_tool", created=0,
+    )
+    tool_choice = tool_payload["choices"][0]
+    assert tool_choice["finish_reason"] == "tool_calls"
+    assert tool_choice["message"]["content"] is None
+    assert tool_choice["message"]["tool_calls"][0]["type"] == "function"
+    assert (
+        tool_choice["message"]["tool_calls"][0]["function"]["arguments"]
+        == '{"city":"Boston","days":2}'
+    )
 
     expect_request_error(
         lambda: module.parse_runner_output(

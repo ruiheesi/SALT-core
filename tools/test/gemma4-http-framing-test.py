@@ -44,12 +44,28 @@ class FakeBackend:
 
     def complete(self, body: dict, **_kwargs):
         self.calls += 1
+        tool_calls = ()
+        content = "ok"
+        finish_reason = "stop"
+        stop_token = 106
+        if body.get("tools"):
+            tool_calls = (
+                module.ToolCall(
+                    id="call_http_test", name="get_weather",
+                    arguments='{"city":"Boston"}',
+                ),
+            )
+            content = ""
+            finish_reason = "tool_calls"
+            stop_token = 50
         return module.Completion(
             result=module.RunnerResult(
-                content="ok", reasoning_content=None, prompt_tokens=1,
-                completion_tokens=1, output_ids=(106,), stop_token=106,
-                finish_reason="stop", response_bytes=2,
+                content=content, reasoning_content=None, prompt_tokens=1,
+                completion_tokens=1, output_ids=(stop_token,),
+                stop_token=stop_token, finish_reason=finish_reason,
+                response_bytes=len(content.encode("utf-8")),
                 kv_loaded_tokens=0, kv_saved_tokens=0,
+                tool_calls=tool_calls,
             ),
             controls=module.Controls(
                 context_tokens=200, output_tokens=50,
@@ -159,6 +175,34 @@ def main() -> None:
             b"\r\n\r\n", 1,
         )[0].lower()
         assert backend.calls == 0, backend.calls
+
+        tool_body = json.dumps({
+            "model": module.DEFAULT_MODEL_ID,
+            "stream": True,
+            "messages": [{"role": "user", "content": "Weather in Boston?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather", "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                },
+            }],
+        }, separators=(",", ":")).encode("utf-8")
+        tool_request = (
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: local\r\n" +
+            b"Connection: close\r\n" +
+            f"Content-Length: {len(tool_body)}\r\n\r\n".encode() + tool_body
+        )
+        tool_response = exchange(port, tool_request)
+        assert tool_response.startswith(b"HTTP/1.1 200 "), tool_response
+        assert b'"tool_calls": [{"index": 0, "id": "call_http_test"' in tool_response
+        assert b'"finish_reason": "tool_calls"' in tool_response
+        assert tool_response.endswith(b"data: [DONE]\n\n"), tool_response[-200:]
+        assert backend.calls == 1, backend.calls
     finally:
         server.shutdown()
         server.server_close()
