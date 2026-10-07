@@ -1983,6 +1983,100 @@ static int serve_loop(SaltGemma4Text *text_model,
                 goto done;
             continue;
         }
+        if (!strncmp(header, "SALT_GEMMA4_PREFILL_PREFIX_V1 ",
+                     sizeof "SALT_GEMMA4_PREFILL_PREFIX_V1 " - 1u)) {
+            unsigned long long prefix_request = 0, prefix_epoch = 0;
+            unsigned long long prefix_turn = 0, prefix_history_turns = 0;
+            unsigned long long raw_position = 0, raw_prompt = 0;
+            int canonical_bytes, prefix_position, prefix_count;
+            char canonical[320], extra;
+            unsigned char state_digest[32], facts_digest[32];
+            char state_hex[65], facts_hex[65], mindset_hex[65];
+            if (sscanf(header,
+                    "SALT_GEMMA4_PREFILL_PREFIX_V1 request=%llu "
+                    "session_epoch=%llu turn_id=%llu history_turns=%llu "
+                    "position=%llu prompt_bytes=%llu %c",
+                    &prefix_request, &prefix_epoch, &prefix_turn,
+                    &prefix_history_turns, &raw_position, &raw_prompt,
+                    &extra) != 6 || prefix_request != expected_request ||
+                raw_position > INT_MAX || raw_prompt < 1 ||
+                raw_prompt > G4_MAX_PROMPT_BYTES) {
+                fputs("gemma4 persistent server: malformed PREFILL_PREFIX_V1\n",
+                      stderr);
+                goto done;
+            }
+            canonical_bytes = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_PREFILL_PREFIX_V1 request=%llu "
+                "session_epoch=%llu turn_id=%llu history_turns=%llu "
+                "position=%llu prompt_bytes=%llu\n",
+                prefix_request, prefix_epoch, prefix_turn,
+                prefix_history_turns, raw_position, raw_prompt);
+            if (canonical_bytes < 0 ||
+                (size_t)canonical_bytes >= sizeof canonical ||
+                strcmp(header, canonical) ||
+                read_exact(stdin, prompt, (size_t)raw_prompt) != 0 ||
+                fgetc(stdin) != '\n')
+                goto done;
+            prompt[raw_prompt] = '\0';
+            expected_request++;
+            prefix_position = salt_gemma4_text_position(text_model);
+            if (prefix_epoch != g_session_epoch || prefix_turn != turn_id ||
+                prefix_history_turns != history_turns ||
+                raw_position != (unsigned long long)prefix_position ||
+                history_turns != 0) {
+                if (emit_reject(prefix_request, "state_conflict",
+                        "prefix prefill epoch/turn/history/position mismatch") != 0)
+                    goto done;
+                continue;
+            }
+            prefix_count = salt_gemma4_text_encode(
+                text_model, prompt, prompt_ids, g_context);
+            if (prefix_count < 1 || prefix_position + prefix_count >= g_context) {
+                if (emit_reject(prefix_request, "context_limit",
+                        "prefix prefill exceeds persistent context capacity") != 0)
+                    goto done;
+                continue;
+            }
+            if (fprintf(stdout,
+                    "GEMMA4_SERVER_PREFIX_START_V1 request=%llu "
+                    "session_epoch=%llu turn_id=%llu history_turns=%llu "
+                    "position=%d prompt_tokens=%d runtime_ready="
+                    G4_RUNTIME_READY_TEXT "\n",
+                    prefix_request, g_session_epoch, turn_id, history_turns,
+                    prefix_position, prefix_count) < 0 || fflush(stdout) != 0)
+                goto done;
+            if (prefill_ordinary_measured(
+                    text_model, prompt_ids, prefix_count, logits) != 0) {
+                emit_fatal(prefix_request, "prefix_prefill",
+                           "engine prefix prefill failed");
+                goto done;
+            }
+            if (fill_state_digests_required(
+                    text_model, state_digest, facts_digest) != 0) {
+                emit_fatal(prefix_request, "prefix_state",
+                           "prefix state digest failed");
+                goto done;
+            }
+            digest_hex(state_digest, state_hex);
+            digest_hex(facts_digest, facts_hex);
+            digest_hex(mindset_sha256, mindset_hex);
+            if (fprintf(stdout,
+                    "GEMMA4_SERVER_PREFIX_RESULT_V1 request=%llu "
+                    "session_epoch=%llu turn_id=%llu history_turns=%llu "
+                    "position_before=%d prompt_tokens=%d position=%d "
+                    "mindset_end=%d state_sha256=%s mindset_sha256=%s "
+                    "facts_sha256=%s facts_rows=%d "
+                    "build_identity_sha256=%s runtime_ready="
+                    G4_RUNTIME_READY_TEXT "\n",
+                    prefix_request, g_session_epoch, turn_id, history_turns,
+                    prefix_position, prefix_count,
+                    salt_gemma4_text_position(text_model), g_mindset_end,
+                    state_hex, mindset_hex, facts_hex,
+                    salt_gemma4_text_position(text_model) - g_mindset_end,
+                    g_build_identity_sha256) < 0 || fflush(stdout) != 0)
+                goto done;
+            continue;
+        }
         if (!strncmp(header, "SALT_GEMMA4_CLEAR_FACTS_V2 ",
                      sizeof "SALT_GEMMA4_CLEAR_FACTS_V2 " - 1u)) {
             unsigned long long clear_request = 0, clear_epoch = 0;
@@ -2193,9 +2287,17 @@ static int serve_loop(SaltGemma4Text *text_model,
         if (prompt_count < 1 ||
             position_before + prompt_count + request_output_limit + 1 >
                 g_context) {
-            if (emit_reject(request_id, "context_limit",
-                    "persistent session configured context/output limit exceeded; "
-                    "factual clear or reset required") != 0)
+            char context_error[256];
+            int context_error_bytes = snprintf(
+                context_error, sizeof context_error,
+                "persistent session context limit exceeded "
+                "(position=%d prompt_tokens=%d output_tokens=%d reserve=1 "
+                "context=%d); reduce the prompt/output, increase context, "
+                "or reset accumulated facts",
+                position_before, prompt_count, request_output_limit, g_context);
+            if (context_error_bytes < 0 ||
+                    (size_t)context_error_bytes >= sizeof context_error ||
+                    emit_reject(request_id, "context_limit", context_error) != 0)
                 goto done;
             continue;
         }
@@ -2379,6 +2481,11 @@ static int serve_loop(SaltGemma4Text *text_model,
             emit_fatal(request_id, "final_decode", "final decode failed");
             goto done;
         }
+        /* Token 50 opens the tool-response block.  Keep it as the committed
+         * continuation boundary instead of appending a synthetic <turn|>.
+         * The next authenticated request supplies the response body and close. */
+        if (stop_token == 50)
+            scheduler.request.close_token = 50;
         if (salt_text_scheduler_finish(scheduler.controller, &scheduler.request,
                 &scheduler.result) != 0) {
             emit_fatal(request_id,

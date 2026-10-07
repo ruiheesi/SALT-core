@@ -2801,9 +2801,9 @@ int salt_gpu_attention_batch(
     kvcount = (uint64_t)(uint32_t)(start_position + batch) *
         (uint32_t)kv_stride;
     tasks = (uint64_t)(uint32_t)batch * (uint32_t)n_heads;
-    score_bytes = (size_t)(start_position + batch) * sizeof(float);
+    score_bytes = (size_t)(start_position + batch <= 8192
+        ? start_position + batch : 4096) * sizeof(float);
     if (qcount > SIZE_MAX || kvcount > SIZE_MAX || tasks > NSUIntegerMax ||
-        score_bytes > 32u * 1024u ||
         metal_shared_range(queries, query_float_offset, (size_t)qcount,
             &qbuffer) != 0 ||
         metal_shared_range(kv, key_float_offset, (size_t)kvcount,
@@ -2836,7 +2836,7 @@ int salt_gpu_attention_batch(
         [enc setBuffer:_op_status offset:0 atIndex:4];
         [enc setBytes:&args length:sizeof args atIndex:5];
         [enc setThreadgroupMemoryLength:score_bytes atIndex:0];
-        [enc setThreadgroupMemoryLength:2u * sizeof(float) atIndex:1];
+        [enc setThreadgroupMemoryLength:4u * sizeof(float) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tasks, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [enc endEncoding];

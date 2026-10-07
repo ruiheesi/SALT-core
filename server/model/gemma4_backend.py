@@ -185,6 +185,11 @@ EFFORT_OUTPUT = {
     "medium": 128,
     "high": 128,
 }
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+# Copilot omits all output-token aliases. Give unspecified requests enough
+# room to finish while retaining the configured native maximum as the ceiling.
+DEFAULT_UNSPECIFIED_OUTPUT_TOKENS = 1_024
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 THINKING_EFFORTS = {"low", "medium", "high"}
 IMAGE_SOFT_TOKENS = 64
 IMAGE_BEGIN = "<|image>"
@@ -668,6 +673,18 @@ class PersistentGemmaEngine:
         "mindset_end", "state_sha256", "mindset_sha256", "facts_sha256",
         "facts_rows", "build_identity_sha256", "runtime_ready",
     )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    PREFIX_START_KEYS = (
+        "request", "session_epoch", "turn_id", "history_turns", "position",
+        "prompt_tokens", "runtime_ready",
+    )
+    PREFIX_RESULT_KEYS = (
+        "request", "session_epoch", "turn_id", "history_turns",
+        "position_before", "prompt_tokens", "position", "mindset_end",
+        "state_sha256", "mindset_sha256", "facts_sha256", "facts_rows",
+        "build_identity_sha256", "runtime_ready",
+    )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 
     DPR_RESULT_KEYS = (
         "request", "mode", "edge_id", "kind", "source_position", "horizon",
@@ -755,6 +772,18 @@ class PersistentGemmaEngine:
         self.stderr_mode = env.get("SALT_SERVER_STDERR", "summary")
         if self.stderr_mode not in ("summary", "diagnostic", "waterfall"):
             raise BackendError("invalid SALT_SERVER_STDERR mode")
+        self.active_client_request_sha256: str | None = None
+        self.active_position = 0
+        self.active_prompt_tokens = 0
+        self.active_image_tokens = 0
+        self.active_output_limit = 0
+        self.active_prefill_completed = 0
+        self.active_prefill_rate = 0.0
+        self.active_prefill_eta_ms: float | None = None
+        self.active_prefill_progress_at = 0.0
+        self.active_started_at = 0.0
+        self.active_decode_tokens = 0
+        self.active_stage = "idle"
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.process_proof_state = "--proof-state" in command
         self.last_dpr_result: dict | None = None
@@ -979,6 +1008,16 @@ class PersistentGemmaEngine:
                     self.events.put(("import", _exact_fields(
                         line, marker.decode(), self.IMPORT_KEYS,
                     )))
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                elif marker == b"GEMMA4_SERVER_PREFIX_START_V1":
+                    self.events.put(("prefix_start", _exact_fields(
+                        line, marker.decode(), self.PREFIX_START_KEYS,
+                    )))
+                elif marker == b"GEMMA4_SERVER_PREFIX_RESULT_V1":
+                    self.events.put(("prefix_result", _exact_fields(
+                        line, marker.decode(), self.PREFIX_RESULT_KEYS,
+                    )))
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 elif marker == b"GEMMA4_SERVER_DPR_MISS_V1":
                     self.events.put(("dpr_miss", _exact_fields(
                         line, marker.decode(), self.DPR_MISS_KEYS,
@@ -1049,15 +1088,66 @@ class PersistentGemmaEngine:
                     break
                 self.logs.append(line)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                if line.startswith(b"GEMMA4_PREFILL_PROGRESS "):
+                    fields = dict(_FIELD_RE.findall(
+                        line.decode("ascii", errors="strict")
+                    ))
+                    if set(fields) != {"start", "completed", "total", "position"}:
+                        raise BackendError("invalid native prefill progress telemetry")
+                    start = _canonical_uint(
+                        fields["start"], "prefill progress start", allow_zero=True,
+                    )
+                    completed = _canonical_uint(
+                        fields["completed"], "prefill progress completed",
+                    )
+                    total = _canonical_uint(
+                        fields["total"], "prefill progress total",
+                    )
+                    position = _canonical_uint(
+                        fields["position"], "prefill progress position",
+                    )
+                    if (self.active_stage != "prefill" or
+                            start != self.active_position or
+                            total != self.active_prompt_tokens or
+                            completed > total or position != start + completed or
+                            completed < self.active_prefill_completed):
+                        raise BackendError("native prefill progress telemetry drift")
+                    now = time.monotonic()
+                    self.active_prefill_completed = completed
+                    elapsed = max(0.0, now - self.active_started_at)
+                    rate = completed / elapsed if elapsed > 0.0 else 0.0
+                    remaining = total - completed
+                    eta_ms = (
+                        None if rate <= 0.0 else remaining / rate * 1000.0
+                    )
+                    self.active_prefill_rate = rate
+                    self.active_prefill_eta_ms = eta_ms
+                    self.active_prefill_progress_at = now
+                    self._log_active_request(
+                        "prefill_progress",
+                        stage="prefill",
+                        kv_loaded_tokens=start,
+                        prompt_tokens=total,
+                        prefill_tokens_completed=completed,
+                        prefill_percent=round(completed * 100.0 / total, 1),
+                        prefill_tokens_per_second=(
+                            None if rate <= 0.0 else round(rate, 3)
+                        ),
+                        estimated_prefill_remaining_ms=(
+                            None if eta_ms is None else round(eta_ms, 3)
+                        ),
+                        elapsed_ms=round(elapsed * 1000.0, 3),
+                    )
                 retained_diagnostic = line.startswith(
                     RETAINED_NATIVE_DIAGNOSTIC_PREFIXES
                 )
+                failure_diagnostic = line.startswith(b"GEMMA4_STEP_FAIL ")
                 # Native stderr is the live operational stream. Forward every
                 # line only in explicit waterfall mode. Diagnostic mode emits
                 # the bounded operational subset; summary mode leaves raw
                 # native lines silent and relies on the always-on request
                 # summary. Retention remains independent of printing.
-                if (self.stderr_mode == "waterfall" or
+                if (failure_diagnostic or self.stderr_mode == "waterfall" or
                         (self.stderr_mode == "diagnostic" and retained_diagnostic)):
                     sys.stderr.write(line.decode("utf-8", errors="replace"))
                     sys.stderr.flush()
@@ -1099,6 +1189,23 @@ class PersistentGemmaEngine:
         if result.content:
             on_delta("content", result.content)
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    def _log_active_request(self, event: str, **fields: object) -> None:
+        if self.active_client_request_sha256 is None:
+            return
+        value = {
+            "event": event,
+            "request_id": self.active_client_request_sha256,
+            **fields,
+        }
+        sys.stderr.write(
+            "[gemma4-request] " +
+            json.dumps(value, sort_keys=True, separators=(",", ":")) +
+            "\n"
+        )
+        sys.stderr.flush()
+
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     def request(self, prompt: str, image_path: Path | None, *,
                 expected_epoch: int, expected_turn: int,
                 expected_history_turns: int, expected_position: int,
@@ -1144,6 +1251,20 @@ class PersistentGemmaEngine:
         request_id = self.request_id
         self.active_request = request_id
         self.phase = "PREPARING"
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        self.active_client_request_sha256 = client_request_sha256
+        self.active_position = expected_position
+        self.active_prompt_tokens = 0
+        self.active_image_tokens = 0
+        self.active_output_limit = output_limit
+        self.active_prefill_completed = 0
+        self.active_prefill_rate = 0.0
+        self.active_prefill_eta_ms = None
+        self.active_prefill_progress_at = 0.0
+        self.active_started_at = time.monotonic()
+        self.active_decode_tokens = 0
+        self.active_stage = "preparing"
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         header = (
             f"SALT_GEMMA4_TURN_V3 request={request_id} "
             f"session_epoch={expected_epoch} turn_id={expected_turn} "
@@ -1219,6 +1340,23 @@ class PersistentGemmaEngine:
                         raise BackendError("persistent V2 START drift")
                     started = True
                     self.phase = "STARTED"
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                    self.active_prompt_tokens = _canonical_uint(
+                        fields["prompt_tokens"], "prompt_tokens",
+                    )
+                    self.active_image_tokens = _canonical_uint(
+                        fields["image_tokens"], "image_tokens", allow_zero=True,
+                    )
+                    self.active_stage = "prefill"
+                    self._log_active_request(
+                        "prefill_start",
+                        stage="prefill",
+                        kv_loaded_tokens=self.active_position,
+                        prompt_tokens=self.active_prompt_tokens,
+                        image_tokens=self.active_image_tokens,
+                        output_limit=self.active_output_limit,
+                    )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     on_start()
                 elif kind == "dpr_prefill":
                     fields = cast(dict[str, str], value)
@@ -1472,6 +1610,33 @@ class PersistentGemmaEngine:
                     if fields["approximate"] not in ("0", "1"):
                         raise BackendError("persistent V2 memory approximation drift")
                     memory_snapshots.append(dict(fields))
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                    if fields["phase"] == "after_prefill":
+                        self.active_prefill_completed = self.active_prompt_tokens
+                        self.active_stage = "decode"
+                        now = time.monotonic()
+                        elapsed = max(0.0, now - self.active_started_at)
+                        self.active_prefill_rate = (
+                            self.active_prompt_tokens / elapsed
+                            if elapsed > 0.0 else 0.0
+                        )
+                        self.active_prefill_eta_ms = 0.0
+                        self.active_prefill_progress_at = now
+                        self._log_active_request(
+                            "prefill_complete",
+                            stage="decode",
+                            kv_loaded_tokens=self.active_position,
+                            prompt_tokens=self.active_prompt_tokens,
+                            prefill_tokens_completed=self.active_prompt_tokens,
+                            prefill_percent=100.0,
+                            prefill_batches_completed=1,
+                            prefill_tokens_per_second=(
+                                None if elapsed <= 0.0 else
+                                round(self.active_prompt_tokens / elapsed, 3)
+                            ),
+                            elapsed_ms=round(elapsed * 1000.0, 3),
+                        )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 elif kind == "token":
                     if not started:
                         raise BackendError("persistent V2 TOKEN before START")
@@ -1487,6 +1652,10 @@ class PersistentGemmaEngine:
                         fields["token_id"], "token_id", allow_zero=True,
                     )
                     stop = _canonical_uint(fields["stop"], "stop", allow_zero=True)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                    self.active_stage = "decode"
+                    self.active_decode_tokens = seq
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     if on_token is not None:
                         on_token(seq, token_id, bool(stop))
                     accumulator.feed(seq, token_id, stop, payload)
@@ -1738,6 +1907,190 @@ class PersistentGemmaEngine:
             self.stop(force=True)
             raise
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    def prefill_prefix(self, prompt: str, *, prefix_sha256: str,
+                       progress_request_sha256: str | None = None,
+                       expected_turn: int, expected_history_turns: int,
+                       expected_position: int) -> dict[str, int | str]:
+        """Commit a reusable prompt prefix without generating a chat turn."""
+        if self.closed or self.process.poll() is not None or self.phase != "READY" or \
+                self.active_request is not None:
+            raise BackendError("persistent Gemma engine is not ready for prefix prefill")
+        if expected_history_turns != 0 or self.history_turns != 0:
+            raise BackendError("prefix prefill requires an empty conversation history")
+        if (expected_turn != self.turn_id or expected_position != self.position or
+                re.fullmatch(r"[0-9a-f]{64}", prefix_sha256) is None):
+            raise BackendError("invalid persistent prefix prefill authority")
+        progress_request_sha256 = self._identity_digest(
+            progress_request_sha256 or prefix_sha256,
+            "prefix progress request digest",
+        )
+        prompt_bytes = prompt.encode("utf-8")
+        if not prompt_bytes or len(prompt_bytes) > MAX_PROMPT_BYTES:
+            raise RequestError("persistent prefix prompt exceeds private limits")
+        self.request_id += 1
+        request_id = self.request_id
+        frame = (
+            f"SALT_GEMMA4_PREFILL_PREFIX_V1 request={request_id} "
+            f"session_epoch={self.session_epoch} turn_id={expected_turn} "
+            f"history_turns={expected_history_turns} position={expected_position} "
+            f"prompt_bytes={len(prompt_bytes)}\n"
+        ).encode("ascii") + prompt_bytes + b"\n"
+        self.active_request = request_id
+        self.phase = "PREFIX_PREFILL"
+        # Attribute the one-time prefix build to the HTTP request that caused
+        # it.  The prefix digest remains the cache identity, but using it as
+        # the active request identity made the outer progress logger hide all
+        # token counters behind a second, seemingly unrelated request id.
+        self.active_client_request_sha256 = progress_request_sha256
+        self.active_position = expected_position
+        self.active_prompt_tokens = 0
+        self.active_image_tokens = 0
+        self.active_output_limit = 0
+        self.active_prefill_completed = 0
+        self.active_prefill_rate = 0.0
+        self.active_prefill_eta_ms = None
+        self.active_prefill_progress_at = 0.0
+        self.active_started_at = time.monotonic()
+        self.active_decode_tokens = 0
+        self.active_stage = "preparing"
+        try:
+            self._write_command(frame)
+            deadline = time.monotonic() + self.timeout
+            started = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                kind, value = self.events.get(timeout=remaining)
+                if kind == "prefix_start":
+                    fields = cast(dict[str, str], value)
+                    prompt_tokens = _canonical_uint(
+                        fields["prompt_tokens"], "prompt_tokens",
+                    )
+                    if (started or
+                            _canonical_uint(fields["request"], "request") != request_id or
+                            _canonical_uint(fields["session_epoch"], "session_epoch") !=
+                                self.session_epoch or
+                            _canonical_uint(fields["turn_id"], "turn_id", allow_zero=True) !=
+                                expected_turn or
+                            _canonical_uint(
+                                fields["history_turns"], "history_turns",
+                                allow_zero=True,
+                            ) != expected_history_turns or
+                            _canonical_uint(
+                                fields["position"], "position", allow_zero=True,
+                            ) != expected_position or
+                            not _runtime_ready_field(fields["runtime_ready"])):
+                        raise BackendError("persistent prefix START drift")
+                    started = True
+                    self.active_prompt_tokens = prompt_tokens
+                    self.active_stage = "prefill"
+                    self._log_active_request(
+                        "prefix_prefill_start", stage="prefix_prefill",
+                        prefix_sha256=prefix_sha256,
+                        kv_loaded_tokens=expected_position,
+                        prompt_tokens=prompt_tokens,
+                    )
+                    continue
+                if kind == "prefix_result":
+                    fields = cast(dict[str, str], value)
+                    actual_position = _canonical_uint(fields["position"], "position")
+                    actual_prompt_tokens = _canonical_uint(
+                        fields["prompt_tokens"], "prompt_tokens",
+                    )
+                    actual_facts_rows = _canonical_uint(
+                        fields["facts_rows"], "facts_rows", allow_zero=True,
+                    )
+                    state_sha256 = fields["state_sha256"]
+                    facts_sha256 = fields["facts_sha256"]
+                    if (not started or
+                            _canonical_uint(fields["request"], "request") != request_id or
+                            _canonical_uint(fields["session_epoch"], "session_epoch") !=
+                                self.session_epoch or
+                            _canonical_uint(fields["turn_id"], "turn_id", allow_zero=True) !=
+                                expected_turn or
+                            _canonical_uint(
+                                fields["history_turns"], "history_turns",
+                                allow_zero=True,
+                            ) != expected_history_turns or
+                            _canonical_uint(
+                                fields["position_before"], "position_before",
+                                allow_zero=True,
+                            ) != expected_position or
+                            actual_prompt_tokens != self.active_prompt_tokens or
+                            actual_position != expected_position + actual_prompt_tokens or
+                            _canonical_uint(
+                                fields["mindset_end"], "mindset_end",
+                                allow_zero=True,
+                            ) != self.mindset_end or
+                            actual_facts_rows != actual_position - self.mindset_end or
+                            re.fullmatch(r"[0-9a-f]{64}", state_sha256) is None or
+                            re.fullmatch(r"[0-9a-f]{64}", facts_sha256) is None or
+                            state_sha256 == "0" * 64 or facts_sha256 == "0" * 64 or
+                            fields["mindset_sha256"] != self.mindset_sha256 or
+                            fields["build_identity_sha256"] !=
+                                self.build_identity_sha256 or
+                            not _runtime_ready_field(fields["runtime_ready"])):
+                        raise BackendError("persistent prefix RESULT drift")
+                    self.position = actual_position
+                    self.state_sha256 = state_sha256
+                    self.facts_sha256 = facts_sha256
+                    self.facts_rows = actual_facts_rows
+                    self.active_prefill_completed = actual_prompt_tokens
+                    self.active_stage = "idle"
+                    self.active_request = None
+                    self.phase = "READY"
+                    elapsed = max(0.0, time.monotonic() - self.active_started_at)
+                    self._log_active_request(
+                        "prefix_prefill_complete", stage="prefix_cached",
+                        prefix_sha256=prefix_sha256,
+                        kv_loaded_tokens=expected_position,
+                        prompt_tokens=actual_prompt_tokens,
+                        prefill_tokens_completed=actual_prompt_tokens,
+                        prefill_percent=100.0,
+                        prefill_tokens_per_second=(
+                            None if elapsed <= 0.0 else
+                            round(actual_prompt_tokens / elapsed, 3)
+                        ),
+                        elapsed_ms=round(elapsed * 1000.0, 3),
+                    )
+                    return {
+                        "position": actual_position,
+                        "prompt_tokens": actual_prompt_tokens,
+                        "state_sha256": state_sha256,
+                        "facts_sha256": facts_sha256,
+                    }
+                if kind == "reject":
+                    fields, payload = cast(tuple[dict[str, str], bytes], value)
+                    if (_canonical_uint(fields["request"], "request") != request_id or
+                            started or fields["mutated"] != "0"):
+                        raise BackendError("persistent prefix reject drift")
+                    self.active_request = None
+                    self.phase = "READY"
+                    raise RequestError(payload.decode("utf-8", errors="replace"))
+                if kind == "fatal_frame":
+                    fields, payload = cast(tuple[dict[str, str], bytes], value)
+                    self.stop(force=True)
+                    raise BackendError(
+                        f"persistent prefix FATAL {fields['code']}: " +
+                        payload.decode("utf-8", errors="replace")
+                    )
+                if kind in ("fatal", "eof", "stderr_eof"):
+                    if isinstance(value, BaseException):
+                        raise BackendError(str(value)) from value
+                    raise BackendError("persistent Gemma pipe closed during prefix prefill")
+                raise BackendError(f"unexpected persistent prefix frame: {kind}")
+        except RequestError:
+            raise
+        except queue.Empty as exc:
+            self.stop(force=True)
+            raise BackendError("persistent Gemma prefix prefill timed out") from exc
+        except BaseException:
+            self.stop(force=True)
+            raise
+
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     def clear_facts(self) -> dict[str, int | str]:
         if self.closed or self.process.poll() is not None or self.phase != "READY":
             raise BackendError("persistent Gemma V2 engine is not ready")
@@ -1999,9 +2352,18 @@ class PersistentGemmaEngine:
         if position_after != (
                 position_before + prompt_tokens + output_steps + synthetic_close):
             raise BackendError("persistent V2 committed-position drift")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        if fields["session_continuable"] != "1" or \
+                (synthetic_close == 0) != (stop_token in (50, 106)):
+            raise BackendError("persistent V2 continuation/turn-close drift")
+        """
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         if fields["session_continuable"] != "1" or \
                 (synthetic_close == 0) != (stop_token == 106):
             raise BackendError("persistent V2 continuation/turn-close drift")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        """
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         try:
             output_ids = tuple(int(item) for item in fields["output_ids"].split(","))
         except ValueError as exc:
@@ -2216,6 +2578,10 @@ class Controls:
 class RenderedChat:
     prompt: str
     image_url: str | None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    prefix: str | None = None
+    prefix_candidates: tuple[str, ...] = ()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 
 
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
@@ -2801,6 +3167,9 @@ class Gemma4Config:
     kv_layout: str = "hybrid"
     kv_budget_gb: float = 1.0
     timeout_s: float = 900.0
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    copilot_cache_id: str | None = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     image_root: Path | None = None
     kv_cache_root: Path | None = None
 
@@ -3015,6 +3384,12 @@ def resolve_controls(body: dict, *, server_kv_budget_gb: float,
         explicit_output if explicit_output is not None
         else min(EFFORT_OUTPUT[effort], max_output_tokens)
     )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    if explicit_output is None:
+        output_tokens = min(
+            DEFAULT_UNSPECIFIED_OUTPUT_TOKENS, max_output_tokens,
+        )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     if output_tokens > max_output_tokens:
         raise RequestError(
             f"requested output cap exceeds server maximum {max_output_tokens} tokens"
@@ -3469,6 +3844,40 @@ def _render_message_tool_call(call: dict[str, object]) -> str:
     )
 
 
+def _tool_content(content: object, *, escape_protocol: bool,
+                  label: str = "tool") -> str:
+    """Read replayed text while keeping literal protocol spellings as data."""
+    values: list[str] = []
+    if isinstance(content, str):
+        values.append(content)
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                raise RequestError(f"{label} content parts must be objects")
+            if part.get("type") not in ("text", "input_text") or \
+                    set(part) - {"type", "text"}:
+                raise RequestError(
+                    f"{label} messages accept only text content parts"
+                )
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise RequestError(
+                    f"{label} text content part requires string text"
+                )
+            values.append(text)
+    else:
+        raise RequestError(
+            f"{label} message content must be a string or text content-part array"
+        )
+    value = "".join(values).strip()
+    if "\0" in value:
+        raise RequestError(f"{label} message content contains NUL")
+    if escape_protocol:
+        for token in sorted(RESERVED_PROMPT_TOKENS, key=len, reverse=True):
+            value = value.replace(token, "\\u003c" + token[1:])
+    return value
+
+
 def _render_tool_response(name: str, value: str) -> str:
     return (
         "<|tool_response>response:" + name +
@@ -3511,6 +3920,8 @@ def render_chat(messages: object, *, enable_thinking: bool,
     image_url: str | None = None
     seen_non_system = False
     body_chunks: list[str] = []
+    user_boundaries: list[int] = []
+    saw_conversation_history = False
     pending_calls: dict[str, str] | None = None
     answered_calls: set[str] = set()
     last_kind: str | None = None
@@ -3536,6 +3947,7 @@ def render_chat(messages: object, *, enable_thinking: bool,
             continue
         seen_non_system = True
         if role == "tool":
+            saw_conversation_history = True
             unknown = set(message) - {"role", "content", "tool_call_id", "name"}
             if unknown:
                 raise RequestError(
@@ -3549,11 +3961,9 @@ def render_chat(messages: object, *, enable_thinking: bool,
             )
             if call_id not in pending_calls or call_id in answered_calls:
                 raise RequestError("tool message has an unknown or duplicate tool_call_id")
-            text, found_image = _text_and_image_parts(
-                message.get("content", ""), "tool",
+            text = _tool_content(
+                message.get("content", ""), escape_protocol=True,
             )
-            if found_image is not None:
-                raise RequestError("tool messages cannot contain images")
             body_chunks.append(_render_tool_response(pending_calls[call_id], text))
             answered_calls.add(call_id)
             last_kind = "tool_response"
@@ -3581,8 +3991,10 @@ def render_chat(messages: object, *, enable_thinking: bool,
             if not text:
                 raise RequestError(f"message {index} has no supported content")
             body_chunks.extend(("<|turn>user\n", text, "<turn|>\n"))
+            user_boundaries.append(len(body_chunks))
             last_kind = "user"
             continue
+        saw_conversation_history = True
         unknown = set(message) - {
             "role", "content", "reasoning_content", "reasoning", "tool_calls",
             "refusal",
@@ -3595,7 +4007,10 @@ def render_chat(messages: object, *, enable_thinking: bool,
         if raw_content is None:
             text, found_image = "", None
         else:
-            text, found_image = _text_and_image_parts(raw_content, role)
+            text = _tool_content(
+                raw_content, escape_protocol=True, label="assistant",
+            )
+            found_image = None
         if found_image is not None:
             raise RequestError("assistant messages cannot contain images")
         raw_calls = message.get("tool_calls")
@@ -3649,6 +4064,14 @@ def render_chat(messages: object, *, enable_thinking: bool,
             chunks.append("\n".join(system_parts))
         chunks.extend(tool_parts)
         chunks.append("<turn|>\n")
+    base_prefix = "".join(chunks)
+    prefix_candidates = [base_prefix]
+    if not saw_conversation_history and last_kind == "user":
+        for boundary in user_boundaries[:-1]:
+            candidate = base_prefix + "".join(body_chunks[:boundary])
+            if candidate != prefix_candidates[-1]:
+                prefix_candidates.append(candidate)
+    prefix = prefix_candidates[-1]
     chunks.extend(body_chunks)
     if last_kind == "user":
         chunks.append("<|turn>model\n")
@@ -3662,7 +4085,176 @@ def render_chat(messages: object, *, enable_thinking: bool,
         raise BackendError("rendered image placeholder count drift")
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise RequestError("rendered prompt exceeds 64 KiB")
-    return RenderedChat(prompt=prompt, image_url=image_url)
+    return RenderedChat(
+        prompt=prompt, image_url=image_url, prefix=prefix,
+        prefix_candidates=tuple(prefix_candidates),
+    )
+
+
+def _tool_history_signature(messages: object) -> tuple[str, ...]:
+    """Canonical message history used to validate Copilot-style replays."""
+    if not isinstance(messages, list) or not messages:
+        raise RequestError("messages required")
+    signature: list[str] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise RequestError("messages must be objects")
+        role = message.get("role")
+        if role in ("system", "developer", "user"):
+            text, image_url = _text_and_image_parts(
+                message.get("content", ""), cast(str, role),
+            )
+            value: dict[str, object] = {
+                "role": role, "content": text, "image_url": image_url,
+            }
+        elif role == "assistant":
+            raw_content = message.get("content")
+            if raw_content is None:
+                text, image_url = "", None
+            else:
+                # A prior model response can legitimately contain a control
+                # spelling. It is safe in this signature because exact replay
+                # reuses existing KV and never renders this text as new input.
+                text = _tool_content(
+                    raw_content, escape_protocol=False, label="assistant",
+                )
+                image_url = None
+            if image_url is not None:
+                raise RequestError("assistant messages cannot contain images")
+            raw_calls = message.get("tool_calls")
+            parsed_calls = (
+                _message_tool_calls(raw_calls, f"message {index} tool_calls")
+                if raw_calls is not None else []
+            )
+            calls = [{
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": json.dumps(
+                        call["arguments"], ensure_ascii=False,
+                        sort_keys=True, separators=(",", ":"), allow_nan=False,
+                    ),
+                },
+            } for call in parsed_calls]
+            value = {
+                "role": role,
+                "content": text,
+                "tool_calls": calls,
+            }
+        elif role == "tool":
+            text = _tool_content(
+                message.get("content", ""), escape_protocol=False,
+            )
+            value = {
+                "role": role,
+                "content": text,
+                "tool_call_id": _tool_text(
+                    message.get("tool_call_id"),
+                    f"message {index} tool_call_id", allow_empty=False,
+                ),
+            }
+        else:
+            raise RequestError(f"unsupported message role: {role!r}")
+        signature.append(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        ))
+    return tuple(signature)
+
+
+def _tool_config_signature(tools: object, tool_choice: object, *,
+                           enable_thinking: bool) -> str:
+    normalized_tools = _normalize_tools(tools)
+    normalized_choice = _normalize_tool_choice(tool_choice, normalized_tools)
+    return json.dumps(
+        {
+            "enable_thinking": enable_thinking,
+            "tool_choice": normalized_choice,
+            "tools": normalized_tools,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _tool_result_history_signature(result: RunnerResult) -> str:
+    # RunnerResult is already native-protocol validated. Do not send generated
+    # text back through client-input validation after the response has committed.
+    return json.dumps(
+        {
+            "role": "assistant",
+            "content": result.content,
+            "tool_calls": [call.as_dict() for call in result.tool_calls],
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _render_tool_continuation(
+        messages: list[dict], *, enable_thinking: bool,
+        pending_calls: dict[str, str],
+) -> RenderedChat:
+    """Render only the suffix appended to an authenticated live tool history."""
+    if not messages:
+        raise RequestError("tool continuation has no appended messages")
+    if not pending_calls:
+        if len(messages) != 1 or messages[0].get("role") != "user":
+            raise RequestError(
+                "completed tool turn continuation requires one new user message"
+            )
+        return render_chat(
+            messages, enable_thinking=enable_thinking, continuation=True,
+        )
+
+    answered: set[str] = set()
+    chunks: list[str] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise RequestError(
+                "pending tool continuation messages must be objects"
+            )
+        if message.get("role") == "user" and answered == set(pending_calls):
+            unknown = set(message) - {"role", "content"}
+            retry_text = _client_text(message.get("content", "")) \
+                if not unknown and isinstance(message.get("content", ""), str) \
+                else ""
+            if retry_text == "Try Again":
+                continue
+        if message.get("role") != "tool":
+            raise RequestError(
+                "pending tool continuation accepts tool results followed only "
+                "by Copilot's Try Again marker"
+            )
+        unknown = set(message) - {"role", "content", "tool_call_id", "name"}
+        if unknown:
+            raise RequestError(
+                "unsupported message fields: " + ", ".join(sorted(unknown))
+            )
+        call_id = _tool_text(
+            message.get("tool_call_id"), f"message {index} tool_call_id",
+            allow_empty=False,
+        )
+        if call_id not in pending_calls or call_id in answered:
+            raise RequestError("tool message has an unknown or duplicate tool_call_id")
+        text = _tool_content(
+            message.get("content", ""), escape_protocol=True,
+        )
+        response = _render_tool_response(pending_calls[call_id], text)
+        opener = "<|tool_response>"
+        if not response.startswith(opener):
+            raise BackendError("tool response continuation framing drift")
+        chunks.append(response[len(opener):])
+        answered.add(call_id)
+    if answered != set(pending_calls):
+        raise RequestError("tool continuation must answer every pending tool call")
+    if not enable_thinking:
+        chunks.append("<|channel>thought\n<channel|>")
+    prompt = "".join(chunks)
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise RequestError("rendered prompt exceeds 64 KiB")
+    return RenderedChat(prompt=prompt, image_url=None)
 
 
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
@@ -4157,6 +4749,13 @@ class Gemma4Backend:
         self.session_history: list[tuple[str, str, str | None]] = []
         self.session_turns: list[dict[str, object]] = []
         self.last_user_signature: tuple[str, str, str | None] | None = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        self.tool_session_history: tuple[str, ...] = ()
+        self.tool_session_config: str | None = None
+        self.tool_pending_calls: dict[str, str] = {}
+        self.tool_prefix_sha256: str | None = None
+        self.copilot_prefix_export: dict[str, object] | None = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.committed_requests: OrderedDict[str, str] = OrderedDict()
         self.last_committed_request_id: str | None = None
         self.transport_records: OrderedDict[str, tuple[int, str]] = OrderedDict()
@@ -4166,6 +4765,12 @@ class Gemma4Backend:
             )
         if config.workers < 1 or config.workers > 8:
             raise BackendError("Gemma 4 workers must be in [1, 8]")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        if config.copilot_cache_id is not None and (
+                KV_CACHE_ID_RE.fullmatch(config.copilot_cache_id) is None or
+                ".." in config.copilot_cache_id):
+            raise BackendError("invalid Copilot KV cache id")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         if (config.mentor_root is None) != (config.mentor_anchor is None):
             raise BackendError(
                 "Gemma 4 mentor root and anchor must be supplied together"
@@ -4477,6 +5082,24 @@ class Gemma4Backend:
                     "seed": getattr(self.engine, "sampler_seed", None),
                     "top_k": getattr(self.engine, "sampler_top_k", None),
                 }
+                if self.copilot_prefix_export is not None:
+                    self.cache_store._export_provenance["copilot_prefix"] = dict(
+                        self.copilot_prefix_export,
+                    )
+                if (cache_id == self.config.copilot_cache_id and
+                        self.tool_session_config is not None and
+                        self.tool_session_history):
+                    self.cache_store._export_provenance["copilot_session"] = {
+                        "schema": "salt.gemma4.copilot-session.v1",
+                        "tool_config": self.tool_session_config,
+                        "history": list(self.tool_session_history),
+                        "pending_calls": dict(self.tool_pending_calls),
+                        "turn_id": self.turn_count,
+                        "history_turns": self.history_turns,
+                        "mindset_end": self.mindset_end,
+                        "state_sha256": self.state_sha256,
+                        "facts_sha256": self.facts_sha256,
+                    }
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 metadata = self.cache_store.publish(
                     selection, int(native["position"]),
@@ -4501,6 +5124,294 @@ class Gemma4Backend:
             },
         }
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    def _restore_copilot_cache(
+            self, incoming_history: tuple[str, ...],
+            tool_config: str) -> bool:
+        cache_id = self.config.copilot_cache_id
+        if (cache_id is None or self.engine is None or self.history_turns != 0 or
+                self.session_position != self.mindset_end):
+            return False
+        store = self._engage_cache_store()
+        if not store.contains(cache_id):
+            return False
+        metadata = store.load_metadata(cache_id)
+        envelope = metadata.metadata
+        inference = (
+            envelope.get("inference") if isinstance(envelope, dict) else None
+        )
+        session = (
+            inference.get("copilot_session")
+            if isinstance(inference, dict) else None
+        )
+        required = {
+            "schema", "tool_config", "history", "pending_calls", "turn_id",
+            "history_turns", "mindset_end", "state_sha256", "facts_sha256",
+        }
+        if not isinstance(session, dict) or set(session) != required or \
+                session.get("schema") != "salt.gemma4.copilot-session.v1":
+            return False
+        cached_history = session["history"]
+        pending_calls = session["pending_calls"]
+        turn_id = session["turn_id"]
+        history_turns = session["history_turns"]
+        state_sha256 = session["state_sha256"]
+        facts_sha256 = session["facts_sha256"]
+        if (session["tool_config"] != tool_config or
+                not isinstance(cached_history, list) or
+                not cached_history or len(cached_history) >= len(incoming_history) or
+                any(not isinstance(item, str) for item in cached_history) or
+                tuple(cached_history) != incoming_history[:len(cached_history)] or
+                not isinstance(pending_calls, dict) or
+                any(not isinstance(key, str) or not isinstance(value, str)
+                    for key, value in pending_calls.items()) or
+                not isinstance(turn_id, int) or turn_id < 1 or
+                not isinstance(history_turns, int) or
+                history_turns < 1 or history_turns > turn_id or
+                session["mindset_end"] != self.mindset_end or
+                re.fullmatch(r"[0-9a-f]{64}", state_sha256 or "") is None or
+                re.fullmatch(r"[0-9a-f]{64}", facts_sha256 or "") is None or
+                metadata.context_tokens != self.config.context_tokens or
+                metadata.build_identity_sha256 != self.build_identity_sha256 or
+                metadata.logical_state_sha256 != state_sha256):
+            return False
+        with store.native_path(metadata) as import_path:
+            native = self.engine.import_session_kv(
+                import_path, turn_id=turn_id,
+                history_turns=history_turns,
+                expected_position=metadata.position,
+                expected_state_sha256=state_sha256,
+                expected_facts_sha256=facts_sha256,
+            )
+        self.turn_count = int(native["turn_id"])
+        self.history_turns = int(native["history_turns"])
+        self.session_position = int(native["position"])
+        self.state_sha256 = str(native["state_sha256"])
+        self.facts_sha256 = str(native["facts_sha256"])
+        self.facts_rows = self.session_position - self.mindset_end
+        self.session_history = []
+        self.session_turns = []
+        self.last_user_signature = None
+        self.tool_session_history = tuple(cached_history)
+        self.tool_session_config = tool_config
+        self.tool_pending_calls = dict(pending_calls)
+        self.committed_requests.clear()
+        self.last_committed_request_id = None
+        self.transport_records.clear()
+        print(
+            "[gemma4-cache] restored Copilot session "
+            f"id={cache_id} tokens={self.session_position} "
+            f"turns={self.history_turns}",
+            file=sys.stderr, flush=True,
+        )
+        return True
+
+    def _copilot_prefix_cache_id(self, prefix_sha256: str) -> str:
+        base = self.config.copilot_cache_id
+        if base is None:
+            raise BackendError("Copilot prefix caching is disabled")
+        suffix = "-prefix-" + prefix_sha256[:16]
+        return base[:64 - len(suffix)] + suffix
+
+    def _restore_copilot_prefix(
+            self, prefix_sha256: str, prefix_bytes: int,
+            tool_config: str) -> bool:
+        if (self.config.copilot_cache_id is None or self.engine is None or
+                self.history_turns != 0 or
+                self.session_position != self.mindset_end):
+            return False
+        cache_id = self._copilot_prefix_cache_id(prefix_sha256)
+        store = self._engage_cache_store()
+        if not store.contains(cache_id):
+            return False
+        metadata = store.load_metadata(cache_id)
+        envelope = metadata.metadata
+        inference = (
+            envelope.get("inference") if isinstance(envelope, dict) else None
+        )
+        prefix = (
+            inference.get("copilot_prefix")
+            if isinstance(inference, dict) else None
+        )
+        required = {
+            "schema", "prefix_sha256", "prefix_bytes", "tool_config",
+            "mindset_end", "state_sha256", "facts_sha256",
+        }
+        if (not isinstance(prefix, dict) or set(prefix) != required or
+                prefix.get("schema") != "salt.gemma4.copilot-prefix.v1" or
+                prefix.get("prefix_sha256") != prefix_sha256 or
+                prefix.get("prefix_bytes") != prefix_bytes or
+                prefix.get("tool_config") != tool_config or
+                prefix.get("mindset_end") != self.mindset_end or
+                prefix.get("state_sha256") != metadata.logical_state_sha256 or
+                re.fullmatch(
+                    r"[0-9a-f]{64}", str(prefix.get("facts_sha256", "")),
+                ) is None or
+                metadata.context_tokens != self.config.context_tokens or
+                metadata.build_identity_sha256 != self.build_identity_sha256 or
+                metadata.position <= self.mindset_end):
+            return False
+        with store.native_path(metadata) as import_path:
+            native = self.engine.import_session_kv(
+                import_path, turn_id=self.turn_count, history_turns=0,
+                expected_position=metadata.position,
+                expected_state_sha256=metadata.logical_state_sha256,
+                expected_facts_sha256=cast(str, prefix["facts_sha256"]),
+            )
+        self.history_turns = 0
+        self.session_position = int(native["position"])
+        self.state_sha256 = str(native["state_sha256"])
+        self.facts_sha256 = str(native["facts_sha256"])
+        self.facts_rows = self.session_position - self.mindset_end
+        self.tool_prefix_sha256 = prefix_sha256
+        self.tool_session_history = ()
+        self.tool_session_config = None
+        self.tool_pending_calls = {}
+        self.committed_requests.clear()
+        self.last_committed_request_id = None
+        self.transport_records.clear()
+        print(
+            "[gemma4-cache] restored Copilot prefix "
+            f"id={cache_id} tokens={self.session_position}",
+            file=sys.stderr, flush=True,
+        )
+        return True
+
+    def _build_copilot_prefix(
+            self, prefix: str, prefix_sha256: str,
+            tool_config: str, *, prefill_prompt: str | None = None,
+            progress_request_sha256: str | None = None) -> None:
+        if self.engine is None or self.config.copilot_cache_id is None:
+            return
+        prompt = prefix if prefill_prompt is None else prefill_prompt
+        if not prompt:
+            raise BackendError("Copilot prefix extension is empty")
+        native = self.engine.prefill_prefix(
+            prompt, prefix_sha256=prefix_sha256,
+            progress_request_sha256=progress_request_sha256,
+            expected_turn=self.turn_count,
+            expected_history_turns=self.history_turns,
+            expected_position=self.session_position,
+        )
+        self.session_position = int(native["position"])
+        self.state_sha256 = str(native["state_sha256"])
+        self.facts_sha256 = str(native["facts_sha256"])
+        self.facts_rows = self.session_position - self.mindset_end
+        self.tool_prefix_sha256 = prefix_sha256
+        cache_id = self._copilot_prefix_cache_id(prefix_sha256)
+        self.copilot_prefix_export = {
+            "schema": "salt.gemma4.copilot-prefix.v1",
+            "prefix_sha256": prefix_sha256,
+            "prefix_bytes": len(prefix.encode("utf-8")),
+            "tool_config": tool_config,
+            "mindset_end": self.mindset_end,
+            "state_sha256": self.state_sha256,
+            "facts_sha256": self.facts_sha256,
+        }
+        try:
+            saved = self.export_cache(
+                cache_id,
+                replace_existing=self._engage_cache_store().contains(cache_id),
+            )
+        finally:
+            self.copilot_prefix_export = None
+        print(
+            "[gemma4-cache] saved Copilot prefix "
+            f"id={cache_id} tokens={saved['position']}",
+            file=sys.stderr, flush=True,
+        )
+
+    def _activate_copilot_prefix(
+            self, rendered: RenderedChat, tool_config: str, *,
+            progress_request_sha256: str | None = None) -> RenderedChat:
+        prefix = rendered.prefix
+        if (self.config.copilot_cache_id is None or prefix is None or
+                rendered.image_url is not None or prefix == rendered.prompt):
+            return rendered
+        candidates = rendered.prefix_candidates or (prefix,)
+        if (not candidates or candidates[-1] != prefix or
+                any(not candidate or
+                    not rendered.prompt.startswith(candidate)
+                    for candidate in candidates) or
+                any(not candidates[index].startswith(candidates[index - 1]) or
+                    len(candidates[index]) <= len(candidates[index - 1])
+                    for index in range(1, len(candidates)))):
+            raise BackendError("invalid Copilot prefix candidate hierarchy")
+        identities = [(
+            hashlib.sha256(
+                b"salt.gemma4.copilot-prefix.v1\0" +
+                candidate.encode("utf-8"),
+            ).hexdigest(),
+            len(candidate.encode("utf-8")),
+        ) for candidate in candidates]
+        current_index: int | None = next((
+            index for index, (digest, _) in enumerate(identities)
+            if digest == self.tool_prefix_sha256
+        ), None)
+        if current_index is None:
+            for index in range(len(candidates) - 1, -1, -1):
+                digest, byte_count = identities[index]
+                try:
+                    restored = self._restore_copilot_prefix(
+                        digest, byte_count, tool_config,
+                    )
+                except (RequestError, OSError, ValueError) as exc:
+                    print(
+                        f"[gemma4-cache] Copilot prefix restore failed: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
+                    restored = False
+                if restored:
+                    current_index = index
+                    break
+        if current_index is None:
+            base_digest, _ = identities[0]
+            self._build_copilot_prefix(
+                candidates[0], base_digest, tool_config,
+                progress_request_sha256=progress_request_sha256,
+            )
+            current_index = 0
+        while current_index + 1 < len(candidates):
+            next_index = current_index + 1
+            next_digest, _ = identities[next_index]
+            extension = candidates[next_index][len(candidates[current_index]):]
+            self._build_copilot_prefix(
+                candidates[next_index], next_digest, tool_config,
+                prefill_prompt=extension,
+                progress_request_sha256=progress_request_sha256,
+            )
+            current_index = next_index
+        prefix_sha256, _ = identities[-1]
+        if self.tool_prefix_sha256 != prefix_sha256:
+            raise BackendError("Copilot prefix activation did not establish authority")
+        if not rendered.prompt.startswith(prefix):
+            raise BackendError("rendered Copilot prefix is not a prompt prefix")
+        suffix = rendered.prompt[len(prefix):]
+        if not suffix:
+            raise RequestError("Copilot request has no prompt after its cached prefix")
+        return RenderedChat(
+            prompt=suffix, image_url=rendered.image_url, prefix=prefix,
+            prefix_candidates=candidates,
+        )
+
+    def _persist_copilot_cache(self) -> None:
+        cache_id = self.config.copilot_cache_id
+        if cache_id is None or not self.tool_session_history:
+            return
+        try:
+            saved = self.export_cache(cache_id, replace_existing=True)
+            print(
+                "[gemma4-cache] saved Copilot session "
+                f"id={cache_id} tokens={saved['position']} "
+                f"turns={self.history_turns}",
+                file=sys.stderr, flush=True,
+            )
+        except (BackendError, RequestError, OSError, ValueError) as exc:
+            print(
+                f"[gemma4-cache] Copilot session save failed: {exc}",
+                file=sys.stderr, flush=True,
+            )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     def import_session_cache(self, cache_id: str, manifest: object) -> dict:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
         self._engage_cache_store()
@@ -4615,6 +5526,12 @@ class Gemma4Backend:
         self.last_user_signature = next(
             (item for item in reversed(history) if item[0] == "user"), None,
         )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        self.tool_session_history = ()
+        self.tool_session_config = None
+        self.tool_pending_calls = {}
+        self.tool_prefix_sha256 = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.committed_requests.clear()
         self.last_committed_request_id = None
         self.transport_records.clear()
@@ -4635,6 +5552,12 @@ class Gemma4Backend:
         self.session_history = []
         self.session_turns = []
         self.last_user_signature = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        self.tool_session_history = ()
+        self.tool_session_config = None
+        self.tool_pending_calls = {}
+        self.tool_prefix_sha256 = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.committed_requests.clear()
         self.last_committed_request_id = None
         self.transport_records.clear()
@@ -4660,6 +5583,12 @@ class Gemma4Backend:
         self.session_history = []
         self.session_turns = []
         self.last_user_signature = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        self.tool_session_history = ()
+        self.tool_session_config = None
+        self.tool_pending_calls = {}
+        self.tool_prefix_sha256 = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.committed_requests.clear()
         self.last_committed_request_id = None
         self.transport_records.clear()
@@ -4732,6 +5661,12 @@ class Gemma4Backend:
         self.session_history = []
         self.session_turns = []
         self.last_user_signature = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        self.tool_session_history = ()
+        self.tool_session_config = None
+        self.tool_pending_calls = {}
+        self.tool_prefix_sha256 = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.committed_requests.clear()
         self.last_committed_request_id = None
         self.transport_records.clear()
@@ -5399,20 +6334,61 @@ class Gemma4Backend:
     ) -> Completion:
         if self.engine is None:
             raise BackendError("persistent Gemma engine has not started")
-        if self.history_turns > 0:
+        incoming_messages = request_body.get("messages")
+        incoming_signature = _tool_history_signature(incoming_messages)
+        config_signature = _tool_config_signature(
+            request_body.get("tools"), request_body.get("tool_choice"),
+            enable_thinking=controls.enable_thinking,
+        )
+        if self.history_turns == 0:
+            try:
+                self._restore_copilot_cache(
+                    incoming_signature, config_signature,
+                )
+            except (BackendError, RequestError, OSError, ValueError) as exc:
+                print(
+                    f"[gemma4-cache] Copilot session restore failed: {exc}",
+                    file=sys.stderr, flush=True,
+                )
+        rendered: RenderedChat | None = None
+        reused_live_kv = False
+        if (self.history_turns > 0 and self.tool_session_history and
+                self.tool_session_config == config_signature and
+                len(incoming_signature) > len(self.tool_session_history) and
+                incoming_signature[:len(self.tool_session_history)] ==
+                self.tool_session_history):
+            assert isinstance(incoming_messages, list)
+            appended = incoming_messages[len(self.tool_session_history):]
+            try:
+                rendered = _render_tool_continuation(
+                    appended, enable_thinking=controls.enable_thinking,
+                    pending_calls=self.tool_pending_calls,
+                )
+            except RequestError:
+                pass
+            else:
+                reused_live_kv = True
+        if not reused_live_kv:
+            rendered = render_chat(
+                incoming_messages,
+                enable_thinking=controls.enable_thinking,
+                continuation=False,
+                tools=request_body.get("tools"),
+                tool_choice=request_body.get("tool_choice"),
+            )
+        if self.history_turns > 0 and not reused_live_kv:
             transport_identity = self.transport_records.get(
                 client_request_sha256,
             )
             self.clear_facts()
             if transport_identity is not None:
                 self.transport_records[client_request_sha256] = transport_identity
-        rendered = render_chat(
-            request_body.get("messages"),
-            enable_thinking=controls.enable_thinking,
-            continuation=False,
-            tools=request_body.get("tools"),
-            tool_choice=request_body.get("tool_choice"),
-        )
+        assert rendered is not None
+        if not reused_live_kv:
+            rendered = self._activate_copilot_prefix(
+                rendered, config_signature,
+                progress_request_sha256=client_request_sha256,
+            )
         if rendered.image_url is not None and self.session_position > 0:
             raise RequestError(
                 "images are supported only on the first persistent turn"
@@ -5472,6 +6448,13 @@ class Gemma4Backend:
         self.mindset_sha256 = result.mindset_sha256
         self.facts_rows = result.facts_rows
         self.session_history = []
+        self.tool_session_history = incoming_signature + (
+            _tool_result_history_signature(result),
+        )
+        self.tool_session_config = config_signature
+        self.tool_pending_calls = {
+            call.id: call.name for call in result.tool_calls
+        }
         self.session_turns.append({
             "turn_id": result.turn_id,
             "prompt_ids": list(result.prompt_ids),
@@ -5485,6 +6468,7 @@ class Gemma4Backend:
         self._remember_committed_request(
             client_request_sha256, request_sha256,
         )
+        self._persist_copilot_cache()
         return Completion(
             result=result, controls=controls,
             modality="image" if rendered.image_url is not None else "text",
@@ -5927,6 +6911,16 @@ def handler_for(backend: Gemma4Backend):
         def log_message(self, format, *args):
             sys.stderr.write("[gemma4-serve] %s\n" % (format % args))
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        def _log_request(self, event: str, **fields: Any) -> None:
+            value = {"event": event, **fields}
+            sys.stderr.write(
+                "[gemma4-request] " +
+                json.dumps(value, sort_keys=True, separators=(",", ":")) +
+                "\n"
+            )
+            sys.stderr.flush()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         def _send_json(self, code: int, value: dict):
             payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
@@ -6064,6 +7058,13 @@ def handler_for(backend: Gemma4Backend):
             stream_started = False
             responses_api = False
             client_disconnected = False
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+            request_log_id: str | None = None
+            request_log_endpoint: str | None = None
+            request_progress_done: threading.Event | None = None
+            request_progress_thread: threading.Thread | None = None
+            decode_started_at: float | None = None
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             try:
                 body = self._body()
                 request_key = self._request_key()
@@ -6181,6 +7182,9 @@ def handler_for(backend: Gemma4Backend):
                     self._error(503, "engine busy (single-flight)", "server_error")
                     return
                 endpoint_name = "responses" if responses_api else "chat"
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                request_log_endpoint = endpoint_name
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 try:
                     client_request_sha256, _ = backend.resolve_request_identity(
                         body, endpoint_name, request_key,
@@ -6193,12 +7197,36 @@ def handler_for(backend: Gemma4Backend):
                     raise
                 stream_requested = body.get("stream") is True
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-                buffered_tool_stream = (
+                tool_stream = (
                     stream_requested and not responses_api and
                     _request_uses_tools(body)
                 )
                 requested_stream_transport = stream_requested
-                stream_requested = stream_requested and not buffered_tool_stream
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                request_log_id = client_request_sha256
+                request_started_at = time.monotonic()
+                requested_output_tokens = next((
+                    body.get(key) for key in (
+                        "max_tokens", "max_completion_tokens",
+                        "max_output_tokens",
+                    ) if body.get(key) is not None
+                ), None)
+                self._log_request(
+                    "start",
+                    request_id=request_log_id,
+                    endpoint=request_log_endpoint,
+                    stream=requested_stream_transport,
+                    tools=len(body.get("tools", []))
+                    if isinstance(body.get("tools"), list) else 0,
+                    messages=len(body.get("messages", []))
+                    if isinstance(body.get("messages"), list) else 0,
+                    session_tokens_before=backend.session_position,
+                    context_tokens=backend.config.context_tokens,
+                    max_output_tokens=requested_output_tokens,
+                    reasoning_effort=body.get("reasoning_effort", "none"),
+                    client=self.client_address[0],
+                )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 completion_id = "chatcmpl-" + unique
                 response_id = "resp_" + unique
@@ -6206,6 +7234,10 @@ def handler_for(backend: Gemma4Backend):
 
                 def start_stream() -> None:
                     nonlocal stream_started, client_disconnected
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                    if stream_started or client_disconnected:
+                        return
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     stream_started = True
                     try:
                         if responses_api:
@@ -6235,21 +7267,154 @@ def handler_for(backend: Gemma4Backend):
                         client_disconnected = True
                         self.close_connection = True
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                def native_token(sequence: int, token_id: int,
+                                 stop: bool) -> None:
+                    nonlocal decode_started_at
+                    now = time.monotonic()
+                    if decode_started_at is None:
+                        decode_started_at = now
+                    if sequence == 1 or sequence % 32 == 0 or stop:
+                        decode_elapsed = max(0.0, now - decode_started_at)
+                        self._log_request(
+                            "decode_start" if sequence == 1 else "decode_progress",
+                            request_id=request_log_id,
+                            endpoint=request_log_endpoint,
+                            stage="decode",
+                            completion_tokens=sequence,
+                            token_id=token_id,
+                            stop=stop,
+                            decode_tokens_per_second=(
+                                None if decode_elapsed <= 0.0 else
+                                round(sequence / decode_elapsed, 3)
+                            ),
+                            elapsed_ms=round(
+                                (now - request_started_at) * 1000.0,
+                                3,
+                            ),
+                        )
+
+                request_progress_done = threading.Event()
+
+                def request_progress() -> None:
+                    nonlocal client_disconnected
+                    assert request_progress_done is not None
+                    while not request_progress_done.wait(10.0):
+                        engine = backend.engine
+                        now = time.monotonic()
+                        progress_fields: dict[str, object] = {}
+                        if (engine is not None and
+                                engine.active_client_request_sha256 ==
+                                request_log_id):
+                            active_elapsed = max(
+                                0.0, now - engine.active_started_at,
+                            )
+                            completed = engine.active_prefill_completed
+                            total = engine.active_prompt_tokens
+                            rate = engine.active_prefill_rate
+                            eta_ms = engine.active_prefill_eta_ms
+                            if (eta_ms is not None and
+                                    engine.active_prefill_progress_at > 0.0):
+                                eta_ms = max(
+                                    0.0,
+                                    eta_ms - (
+                                        now - engine.active_prefill_progress_at
+                                    ) * 1000.0,
+                                )
+                            progress_fields = {
+                                "stage": engine.active_stage,
+                                "kv_loaded_tokens": engine.active_position,
+                                "prompt_tokens": total,
+                                "prefill_tokens_completed": completed,
+                                "prefill_percent": (
+                                    None if total < 1 else
+                                    round(completed * 100.0 / total, 1)
+                                ),
+                                "prefill_batch_in_flight":
+                                    engine.active_stage == "prefill",
+                                "prefill_tokens_per_second": (
+                                    None if rate <= 0.0 else round(rate, 3)
+                                ),
+                                "estimated_prefill_remaining_ms": (
+                                    None if eta_ms is None else round(eta_ms, 3)
+                                ),
+                                "completion_tokens": engine.active_decode_tokens,
+                                "output_limit": engine.active_output_limit,
+                            }
+                        self._log_request(
+                            "progress",
+                            request_id=request_log_id,
+                            endpoint=request_log_endpoint,
+                            native_phase=(
+                                (
+                                    engine.active_stage.upper()
+                                    if engine.phase == "STARTED" else engine.phase
+                                ) if engine is not None else "unavailable"
+                            ),
+                            elapsed_ms=round(
+                                (now - request_started_at) * 1000.0, 3,
+                            ),
+                            **progress_fields,
+                        )
+                        if (stream_started and not client_disconnected and
+                                requested_stream_transport):
+                            try:
+                                self._write_sse_comment("salt keep-alive")
+                            except OSError:
+                                client_disconnected = True
+                                self.close_connection = True
+
+                request_progress_thread = threading.Thread(
+                    target=request_progress,
+                    name="gemma4-request-progress",
+                    daemon=True,
+                )
+                request_progress_thread.start()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 try:
                     completion = backend.complete(
                         body, endpoint=endpoint_name,
                         request_key=request_key,
                         on_stream_start=start_stream if stream_requested else None,
                         on_stream_delta=stream_delta if stream_requested else None,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                        on_native_token=native_token,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     )
                 finally:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                    if request_progress_done is not None:
+                        request_progress_done.set()
+                    if request_progress_thread is not None:
+                        request_progress_thread.join(timeout=1.0)
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     backend.lock.release()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                self._log_request(
+                    "complete",
+                    request_id=request_log_id,
+                    endpoint=request_log_endpoint,
+                    status=200,
+                    stream=requested_stream_transport,
+                    prompt_tokens=(
+                        completion.kv_cache.loaded_tokens +
+                        completion.result.prompt_tokens
+                    ),
+                    new_prompt_tokens=completion.result.prompt_tokens,
+                    kv_loaded_tokens=completion.kv_cache.loaded_tokens,
+                    kv_saved_tokens=completion.kv_cache.saved_tokens,
+                    completion_tokens=completion.result.completion_tokens,
+                    finish_reason=completion.result.finish_reason,
+                    replayed=completion.result.replayed,
+                    elapsed_ms=round(completion.elapsed_s * 1000.0, 3),
+                )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
                 stream_requested = requested_stream_transport
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 if stream_requested:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-                    if buffered_tool_stream:
+                    if not stream_started:
                         start_stream()
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                     if client_disconnected:
@@ -6260,8 +7425,8 @@ def handler_for(backend: Gemma4Backend):
                         )
                     else:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-                        if buffered_tool_stream:
-                            self._stream_buffered_chat_result(
+                        if tool_stream:
+                            self._stream_chat_tool_calls(
                                 completion, completion_id, created,
                             )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
@@ -6284,12 +7449,32 @@ def handler_for(backend: Gemma4Backend):
                     completion_id=completion_id, created=created,
                 ))
             except RequestError as exc:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                self._log_request(
+                    "failed",
+                    request_id=request_log_id,
+                    endpoint=request_log_endpoint,
+                    status=400,
+                    error_type="invalid_request_error",
+                    error=str(exc),
+                )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 if stream_started:
                     if not client_disconnected:
                         self._stream_error(str(exc), responses_api=responses_api)
                 elif not client_disconnected:
                     self._error(400, str(exc), "invalid_request_error")
             except BackendError as exc:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                self._log_request(
+                    "failed",
+                    request_id=request_log_id,
+                    endpoint=request_log_endpoint,
+                    status=500,
+                    error_type="backend_error",
+                    error=str(exc),
+                )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 sys.stderr.write(f"[gemma4-serve] backend error: {exc}\n")
                 sys.stderr.flush()
                 try:
@@ -6315,12 +7500,29 @@ def handler_for(backend: Gemma4Backend):
                     self._error(500, "Gemma 4 backend failed", "server_error")
             except BrokenPipeError:
                 self.close_connection = True
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                self._log_request(
+                    "client_disconnected",
+                    request_id=request_log_id,
+                    endpoint=request_log_endpoint,
+                )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 sys.stderr.write(
                     "[gemma4-serve] client disconnected after commit; "
                     "response remains replayable\n"
                 )
                 sys.stderr.flush()
             except Exception as exc:
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+                self._log_request(
+                    "failed",
+                    request_id=request_log_id,
+                    endpoint=request_log_endpoint,
+                    status=500,
+                    error_type="server_error",
+                    error=str(exc),
+                )
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 sys.stderr.write(
                     f"[gemma4-serve] unexpected backend error: {exc}\n"
                 )
@@ -6349,6 +7551,29 @@ def handler_for(backend: Gemma4Backend):
             )
             self.wfile.flush()
 
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        def _sse_lock(self) -> threading.Lock:
+            lock = getattr(self, "_stream_write_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._stream_write_lock = lock
+            return lock
+
+        def _write_sse(self, value: dict, *, event: str | None = None) -> None:
+            with self._sse_lock():
+                if event is not None:
+                    self.wfile.write(("event: " + event + "\n").encode("ascii"))
+                self.wfile.write(
+                    ("data: " + json.dumps(value, ensure_ascii=False) +
+                     "\n\n").encode("utf-8")
+                )
+                self.wfile.flush()
+
+        def _write_sse_comment(self, value: str) -> None:
+            with self._sse_lock():
+                self.wfile.write((": " + value + "\n\n").encode("ascii"))
+                self.wfile.flush()
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         @staticmethod
         def _chat_chunk(completion_id: str, created: int, delta: dict,
                         finish_reason: str | None = None) -> dict:
@@ -6377,19 +7602,10 @@ def handler_for(backend: Gemma4Backend):
                 completion_id, created, {key: value},
             ))
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-        def _stream_buffered_chat_result(
+        def _stream_chat_tool_calls(
                 self, completion: Completion,
                 completion_id: str, created: int) -> None:
             result = completion.result
-            if result.reasoning_content:
-                self._stream_chat_delta(
-                    completion_id, created,
-                    "reasoning_content", result.reasoning_content,
-                )
-            if result.content:
-                self._stream_chat_delta(
-                    completion_id, created, "content", result.content,
-                )
             for index, call in enumerate(result.tool_calls):
                 self._write_sse(self._chat_chunk(
                     completion_id, created, {
@@ -6706,6 +7922,9 @@ def serve_from_args(args) -> int:
         timeout_s=_gemma_float_setting(
             args.gemma_timeout_s, "GEMMA4_TIMEOUT_S", 900.0,
         ),
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        copilot_cache_id=args.gemma_copilot_cache_id,
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         image_root=(Path(args.gemma_image_root).expanduser()
                     if args.gemma_image_root else None),
         kv_cache_root=(Path(args.gemma_kv_cache_root).expanduser()
@@ -6735,6 +7954,10 @@ def serve_from_args(args) -> int:
             f"kv-max={config.kv_budget_gb:g}GB "
             f"CTX{config.context_tokens}/O{config.max_output_tokens} "
             f"prefill-chunk={config.prefill_chunk_tokens} "
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+            f"timeout={config.timeout_s:g}s "
+            f"copilot-cache={config.copilot_cache_id or 'off'} "
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             f"one-live-session "
             f"runtime_ready={str(RUNTIME_READY).lower()}",
             file=sys.stderr, flush=True,

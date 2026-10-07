@@ -16,6 +16,14 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:8090/v1/chat/completions"
 DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 
 
+def dispatch_command() -> None:
+    """Handle utility subcommands before parsing a chat prompt."""
+    if len(sys.argv) < 2 or sys.argv[1] not in {"start", "restart", "logs"}:
+        return
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "salt-start.sh")
+    os.execv(script, [script, *sys.argv[1:]])
+
+
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stream a response from the local SALT Gemma server.",
@@ -33,6 +41,7 @@ def fail(message: str) -> int:
 
 
 def main() -> int:
+    dispatch_command()
     args = arguments()
     if args.max_tokens < 1:
         return fail("--max-tokens must be positive")

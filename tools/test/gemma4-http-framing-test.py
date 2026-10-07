@@ -23,10 +23,13 @@ spec.loader.exec_module(module)
 
 class FakeBackend:
     def __init__(self) -> None:
-        self.config = SimpleNamespace(model_id=module.DEFAULT_MODEL_ID)
+        self.config = SimpleNamespace(
+            model_id=module.DEFAULT_MODEL_ID, context_tokens=200,
+        )
         self.cache_store = None
         self.lock = threading.Lock()
         self.calls = 0
+        self.session_position = 0
 
     def capabilities(self) -> dict:
         return {"runtime_ready": module.RUNTIME_READY}
@@ -46,9 +49,17 @@ class FakeBackend:
         self.calls += 1
         tool_calls = ()
         content = "ok"
+        reasoning_content = None
         finish_reason = "stop"
         stop_token = 106
         if body.get("tools"):
+            reasoning_content = "choosing tool"
+            on_stream_start = _kwargs.get("on_stream_start")
+            on_stream_delta = _kwargs.get("on_stream_delta")
+            assert on_stream_start is not None
+            assert on_stream_delta is not None
+            on_stream_start()
+            on_stream_delta("reasoning_content", reasoning_content)
             tool_calls = (
                 module.ToolCall(
                     id="call_http_test", name="get_weather",
@@ -60,7 +71,7 @@ class FakeBackend:
             stop_token = 50
         return module.Completion(
             result=module.RunnerResult(
-                content=content, reasoning_content=None, prompt_tokens=1,
+                content=content, reasoning_content=reasoning_content, prompt_tokens=1,
                 completion_tokens=1, output_ids=(stop_token,),
                 stop_token=stop_token, finish_reason=finish_reason,
                 response_bytes=len(content.encode("utf-8")),
@@ -199,6 +210,10 @@ def main() -> None:
         )
         tool_response = exchange(port, tool_request)
         assert tool_response.startswith(b"HTTP/1.1 200 "), tool_response
+        assert tool_response.count(b'"reasoning_content": "choosing tool"') == 1
+        assert tool_response.index(b'"reasoning_content"') < tool_response.index(
+            b'"tool_calls"'
+        )
         assert b'"tool_calls": [{"index": 0, "id": "call_http_test"' in tool_response
         assert b'"finish_reason": "tool_calls"' in tool_response
         assert tool_response.endswith(b"data: [DONE]\n\n"), tool_response[-200:]

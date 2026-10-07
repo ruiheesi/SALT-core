@@ -162,6 +162,51 @@ def main() -> None:
         "<|channel>thought\n<channel|>"
     )
     assert "<bos>" not in continuation.prompt
+    prefixed = module.render_chat(
+        [
+            {"role": "system", "content": "stable policy"},
+            {"role": "user", "content": "new question"},
+        ],
+        enable_thinking=False,
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "lookup", "description": "Look up a value.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+    )
+    assert prefixed.prefix is not None
+    assert prefixed.prompt.startswith(prefixed.prefix)
+    assert "stable policy" in prefixed.prefix
+    assert "<|tool>declaration:lookup" in prefixed.prefix
+    assert "new question" not in prefixed.prefix
+    assert prefixed.prompt[len(prefixed.prefix):].startswith("<|turn>user\n")
+    headroom = module.render_chat(
+        [
+            {"role": "system", "content": "stable policy"},
+            {"role": "user", "content": "stable Copilot workspace context"},
+            {"role": "user", "content": "variable user question"},
+        ],
+        enable_thinking=False,
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "lookup", "description": "Look up a value.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+    )
+    assert len(headroom.prefix_candidates) == 2
+    assert headroom.prefix_candidates[0].endswith("<turn|>\n")
+    assert "stable Copilot workspace context" not in \
+        headroom.prefix_candidates[0]
+    assert "stable Copilot workspace context" in \
+        headroom.prefix_candidates[1]
+    assert "variable user question" not in headroom.prefix_candidates[1]
+    assert headroom.prompt[len(headroom.prefix or ""):].startswith(
+        "<|turn>user\nvariable user question"
+    )
     expect_request_error(
         lambda: module.render_chat(
             [
@@ -356,6 +401,272 @@ def main() -> None:
             import_path = framed
         assert not import_path.exists()
         assert not list(backend.cache_store.root.glob(".kv-import-*"))
+
+        class CopilotExportEngine:
+            sampler_abi = "test"
+            temperature_bits = 0
+            sampler_seed = 0
+            sampler_top_k = 1
+
+            def export_kv(self, path: Path) -> dict:
+                write_cache(path)
+                values = module.KV_CACHE_HEADER.unpack(
+                    path.read_bytes()[:module.KV_CACHE_HEADER.size]
+                )
+                return {
+                    "position": 1,
+                    "state_sha256": values[37].hex(),
+                    "facts_sha256": "b" * 64,
+                }
+
+        copilot_root = root / "copilot-exports"
+        copilot_build = bytes.fromhex("77" * 32)
+        copilot_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=copilot_root,
+            copilot_cache_id="copilot-default",
+        ))
+        copilot_backend.engine = CopilotExportEngine()
+        copilot_backend.cache_store = module.KVCacheStore(
+            copilot_root, module.KV_COMPATIBILITY_SHA256, copilot_build,
+        )
+        copilot_backend.build_identity_sha256 = copilot_build.hex()
+        copilot_backend.turn_count = 1
+        copilot_backend.history_turns = 1
+        copilot_backend.session_position = 1
+        copilot_backend.tool_session_config = "tools-v1"
+        copilot_backend.tool_session_history = ("system-and-user", "assistant")
+        copilot_backend.tool_pending_calls = {}
+        copilot_backend._persist_copilot_cache()
+        copilot_metadata = copilot_backend.cache_store.load_metadata(
+            "copilot-default"
+        )
+        copilot_session = copilot_metadata.metadata["inference"][
+            "copilot_session"
+        ]
+        assert copilot_session["history"] == ["system-and-user", "assistant"]
+        assert copilot_session["tool_config"] == "tools-v1"
+
+        class CopilotImportEngine:
+            def import_session_kv(self, path: Path, **values) -> dict:
+                assert path.is_file()
+                assert values["expected_position"] >= 1
+                return {
+                    "turn_id": values["turn_id"],
+                    "history_turns": values["history_turns"],
+                    "position": values["expected_position"],
+                    "state_sha256": values["expected_state_sha256"],
+                    "facts_sha256": values["expected_facts_sha256"],
+                }
+
+        restored_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=copilot_root,
+            copilot_cache_id="copilot-default",
+        ))
+        restored_backend.engine = CopilotImportEngine()
+        restored_backend.cache_store = module.KVCacheStore(
+            copilot_root, module.KV_COMPATIBILITY_SHA256, copilot_build,
+        )
+        restored_backend.build_identity_sha256 = copilot_build.hex()
+        assert restored_backend._restore_copilot_cache(
+            ("system-and-user", "assistant", "new-user"), "tools-v1",
+        )
+        assert restored_backend.session_position == 1
+        assert restored_backend.tool_session_history == (
+            "system-and-user", "assistant",
+        )
+
+        class CopilotPrefixEngine:
+            sampler_abi = "test"
+            temperature_bits = 0
+            sampler_seed = 0
+            sampler_top_k = 1
+
+            def __init__(self):
+                self.position = 0
+                self.state_sha256 = ""
+                self.facts_sha256 = "b" * 64
+                self.prefill_prompts: list[str] = []
+                self.progress_request_sha256s: list[str | None] = []
+
+            def prefill_prefix(self, prompt: str, **values) -> dict:
+                assert values["expected_history_turns"] == 0
+                assert values["expected_position"] == self.position
+                self.prefill_prompts.append(prompt)
+                self.progress_request_sha256s.append(
+                    values.get("progress_request_sha256")
+                )
+                self.position += 2
+                framed = root / "prefix-state.g4kv"
+                write_cache(framed, position=self.position)
+                header = module.KV_CACHE_HEADER.unpack(
+                    framed.read_bytes()[:module.KV_CACHE_HEADER.size]
+                )
+                framed.unlink()
+                self.state_sha256 = header[37].hex()
+                return {
+                    "position": self.position,
+                    "prompt_tokens": 2,
+                    "state_sha256": self.state_sha256,
+                    "facts_sha256": self.facts_sha256,
+                }
+
+            def export_kv(self, path: Path) -> dict:
+                write_cache(path, position=self.position)
+                return {
+                    "position": self.position,
+                    "state_sha256": self.state_sha256,
+                    "facts_sha256": self.facts_sha256,
+                }
+
+        prefix_root = root / "copilot-prefix-exports"
+        prefix_build = bytes.fromhex("88" * 32)
+        prefix_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=prefix_root,
+            copilot_cache_id="copilot-default",
+        ))
+        prefix_backend.engine = CopilotPrefixEngine()
+        prefix_backend.cache_store = module.KVCacheStore(
+            prefix_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        prefix_backend.build_identity_sha256 = prefix_build.hex()
+        prefix_sha256 = hashlib.sha256(
+            b"salt.gemma4.copilot-prefix.v1\0" +
+            prefixed.prefix.encode("utf-8")
+        ).hexdigest()
+        prefix_backend._build_copilot_prefix(
+            prefixed.prefix, prefix_sha256, "tools-v1",
+            progress_request_sha256="9" * 64,
+        )
+        assert prefix_backend.engine.progress_request_sha256s == ["9" * 64]
+        prefix_cache_id = prefix_backend._copilot_prefix_cache_id(
+            prefix_sha256,
+        )
+        prefix_metadata = prefix_backend.cache_store.load_metadata(
+            prefix_cache_id,
+        )
+        prefix_record = prefix_metadata.metadata["inference"][
+            "copilot_prefix"
+        ]
+        assert prefix_record["prefix_sha256"] == prefix_sha256
+        assert prefix_record["prefix_bytes"] == len(
+            prefixed.prefix.encode("utf-8")
+        )
+        assert prefix_record["tool_config"] == "tools-v1"
+
+        prefix_restored = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=prefix_root,
+            copilot_cache_id="copilot-default",
+        ))
+        prefix_restored.engine = CopilotImportEngine()
+        prefix_restored.cache_store = module.KVCacheStore(
+            prefix_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        prefix_restored.build_identity_sha256 = prefix_build.hex()
+        assert prefix_restored._restore_copilot_prefix(
+            prefix_sha256, len(prefixed.prefix.encode("utf-8")), "tools-v1",
+        )
+        assert prefix_restored.session_position == 2
+        assert prefix_restored.history_turns == 0
+        activated = prefix_restored._activate_copilot_prefix(
+            prefixed, "tools-v1",
+        )
+        assert activated.prompt == prefixed.prompt[len(prefixed.prefix):]
+        assert activated.prefix == prefixed.prefix
+
+        hierarchy_root = root / "copilot-headroom-exports"
+        hierarchy_engine = CopilotPrefixEngine()
+        hierarchy_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=hierarchy_root,
+            copilot_cache_id="copilot-default",
+        ))
+        hierarchy_backend.engine = hierarchy_engine
+        hierarchy_backend.cache_store = module.KVCacheStore(
+            hierarchy_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        hierarchy_backend.build_identity_sha256 = prefix_build.hex()
+        hierarchy_active = hierarchy_backend._activate_copilot_prefix(
+            headroom, "tools-v1", progress_request_sha256="a" * 64,
+        )
+        assert hierarchy_engine.prefill_prompts == [
+            headroom.prefix_candidates[0],
+            headroom.prefix_candidates[1][
+                len(headroom.prefix_candidates[0]):
+            ],
+        ]
+        assert hierarchy_engine.progress_request_sha256s == [
+            "a" * 64, "a" * 64,
+        ]
+        assert hierarchy_active.prompt == headroom.prompt[
+            len(headroom.prefix or ""):
+        ]
+        for candidate in headroom.prefix_candidates:
+            digest = hashlib.sha256(
+                b"salt.gemma4.copilot-prefix.v1\0" +
+                candidate.encode("utf-8")
+            ).hexdigest()
+            assert hierarchy_backend.cache_store.contains(
+                hierarchy_backend._copilot_prefix_cache_id(digest)
+            )
+
+        changed_headroom = module.render_chat(
+            [
+                {"role": "system", "content": "stable policy"},
+                {"role": "user", "content": "different workspace context"},
+                {"role": "user", "content": "another variable question"},
+            ],
+            enable_thinking=False,
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "lookup", "description": "Look up a value.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+        )
+        assert changed_headroom.prefix_candidates[0] == \
+            headroom.prefix_candidates[0]
+
+        class HeadroomRestoreEngine(CopilotPrefixEngine):
+            def import_session_kv(self, path: Path, **values) -> dict:
+                assert path.is_file()
+                self.position = values["expected_position"]
+                self.state_sha256 = values["expected_state_sha256"]
+                self.facts_sha256 = values["expected_facts_sha256"]
+                return {
+                    "turn_id": values["turn_id"],
+                    "history_turns": values["history_turns"],
+                    "position": self.position,
+                    "state_sha256": self.state_sha256,
+                    "facts_sha256": self.facts_sha256,
+                }
+
+        changed_engine = HeadroomRestoreEngine()
+        changed_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=hierarchy_root,
+            copilot_cache_id="copilot-default",
+        ))
+        changed_backend.engine = changed_engine
+        changed_backend.cache_store = module.KVCacheStore(
+            hierarchy_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        changed_backend.build_identity_sha256 = prefix_build.hex()
+        changed_active = changed_backend._activate_copilot_prefix(
+            changed_headroom, "tools-v1",
+        )
+        assert changed_engine.prefill_prompts == [
+            changed_headroom.prefix_candidates[1][
+                len(changed_headroom.prefix_candidates[0]):
+            ],
+        ]
+        assert changed_active.prompt == changed_headroom.prompt[
+            len(changed_headroom.prefix or ""):
+        ]
 
         runtime_root = root / "runtime-exports"
         runtime_backend = module.Gemma4Backend(module.Gemma4Config(

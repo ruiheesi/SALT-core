@@ -14,14 +14,14 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/gemma4_text.c",
       "snapshot_sha256": "2276829cd1e01df341577ea3e1b0227e2c54b171174ea3c74098d2543c3b6952",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "6e486b795c8c16d43bcd60b7a981c88e5287dd3b95b8a3bc633e1071e281b0f4"
+      "live_sha256": "3c3e1a711d3c0d1cf61d5494ede16ffad5ce4c0c5f1996929951b8a80506bcf2"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/server.c",
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/models/gemma4-26b-a4b/server.c",
       "snapshot_sha256": "2a725507b84562a9bd0bbde21b7c7f1a2aff61be585fb54df10f0924344cfd83",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "2154c12ed4e6bd6eb205f6da4901d15085943d6959bab67e35690ba2397a1870"
+      "live_sha256": "2f437814456c7f4bc9b72bf622023df731d1f6125023f8c5cad8893151a80672"
     },
     {
       "logical_path": "models/gemma4-26b-a4b/server.config",
@@ -42,7 +42,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/gemma4_backend.py",
       "snapshot_sha256": "361facedbc836412b3423eee3fea0261aeec01fdec3dc0ba061c7961ceaa7562",
       "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "b5d7dac63866c4d64f722a9c08324568a1697d8260747dfffaa2022ba9f9a993"
+      "physical_blocks_sha256": "ffdd2f28fbc24023d39c92aa14320f0f8527c97f4b1016c3738ca4614b2674b0"
     },
     {
       "logical_path": "server/gemma4_compat.py",
@@ -56,7 +56,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/serve.py",
       "snapshot_sha256": "2cafc3835c8a9f8f1006223262751ea00b79a981d66a88350ebc1e70508b7c8e",
       "live_projection": "strip-physical-build-blocks-v1",
-      "physical_blocks_sha256": "01242c4ab1dcd6e4445133ad9662c26518524c6ab6b05557443c093e0292a70c"
+      "physical_blocks_sha256": "fe9d45bd399bc3163f3d3784a53998313f4df3e74782069924b76d8859993579"
     },
     {
       "logical_path": "src/tokenizer.c",

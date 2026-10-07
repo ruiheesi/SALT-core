@@ -414,6 +414,10 @@ struct SaltGemma4Text {
     int prefill_retain_layers;
     int prefill_decode_lookahead_enabled;
     SaltTextPhaseLookahead prefill_decode_lookahead;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    int prefill_progress_start;
+    int prefill_progress_total;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     int tokenizer_fd;
     SaltTokenizer tokenizer;
     int tokenizer_set;
@@ -1728,6 +1732,15 @@ static int init_expert_cache(SaltGemma4Text *model) {
     budget_bytes = (uint64_t)budget_gb * G4_EXPERT_BUDGET_UNIT;
     slots = budget_bytes / (uint64_t)G4_SLOT_BYTES;
     if (slots > count) slots = count;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+#if defined(__APPLE__)
+    /* Metal selected-resource tables are qualified for at most 512 live
+     * expert mappings. A larger byte ceiling remains valid, but residency
+     * must not exceed the backend's resource-table capacity. */
+    if (model->full_gpu_intent && model->gpu_bounded_weights && slots > 512u)
+        slots = 512u;
+#endif
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     if (slots < G4_TOPK || slots > INT_MAX ||
         (preload_count > 0 &&
          (uint64_t)preload_count * G4_EXPERTS + G4_EXPERTS > slots))
@@ -9359,6 +9372,19 @@ static int g4_prefill_ffn(void *opaque, int layer, int start, int batch,
                          model->position);
     if (g4_memory_budget_ok(model, "prefill-layer", layer) != 0)
         return step_fail("prefill-memory-limit", layer, model->position);
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    if (layer == G4_LAYERS - 1 && model->prefill_progress_total > 0) {
+        int completed = start + batch - model->prefill_progress_start;
+        if (completed < 1 || completed > model->prefill_progress_total)
+            return step_fail("prefill-progress", layer, model->position);
+        fprintf(stderr,
+            "GEMMA4_PREFILL_PROGRESS start=%d completed=%d total=%d "
+            "position=%d\n",
+            model->prefill_progress_start, completed,
+            model->prefill_progress_total, start + batch);
+        fflush(stderr);
+    }
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     return 0;
 }
 
@@ -10017,8 +10043,16 @@ int salt_gemma4_text_prefill(SaltGemma4Text *model,
     ops.release_layer = g4_prefill_release;
     ops.finish = g4_prefill_finish;
     ops.publish_position = g4_prefill_publish;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    model->prefill_progress_start = start;
+    model->prefill_progress_total = token_count;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     rc = salt_text_prefill_execute(
         &plan, &ops, model, start, tokens, token_count, logits);
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1 */
+    model->prefill_progress_start = 0;
+    model->prefill_progress_total = 0;
+/* SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1 */
     if (rc != 0) {
         if (g4_gpu_kv_rewind(model, start) != 0 ||
             g4_text_state_publish(model, start) != 0)

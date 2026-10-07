@@ -159,6 +159,9 @@ def build_parser():
     p.add_argument("--gemma-kv-budget-gb", type=float, default=None)
     p.add_argument("--gemma-timeout-s", type=float, default=None)
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    p.add_argument("--gemma-copilot-cache-id",
+                   default=os.environ.get("GEMMA4_COPILOT_CACHE_ID"),
+                   help="automatically persist and restore matching Copilot tool sessions")
     p.add_argument("--gemma-target-route-n", type=int, default=None,
                    help="startup NFQ sequence depth; defaults from the recipe")
     p.add_argument("--gemma-target-x", type=int, default=None,

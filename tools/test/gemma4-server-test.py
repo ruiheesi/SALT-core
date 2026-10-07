@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -82,6 +83,12 @@ def main() -> None:
     assert controls.seed == 0
     assert controls.top_k == 1
     assert controls.rng_abi == "none"
+
+    copilot_default = module.resolve_controls(
+        {}, server_kv_budget_gb=1.25,
+        context_tokens=20_200, max_output_tokens=4_096,
+    )
+    assert copilot_default.output_tokens == 1_024
 
     sampled = module.resolve_controls(
         {"temperature": 0.8, "seed": 42, "top_k": 20},
@@ -507,6 +514,97 @@ def main() -> None:
         "<tool_response|><|channel>thought\n<channel|>"
     )
 
+    # Copilot resends the full history after executing a tool.  The server can
+    # authenticate that prefix and append only the tool result to the live KV.
+    tool_initial = module.render_chat([
+        {"role": "user", "content": "What is the weather in Boston?"},
+    ], enable_thinking=False, tools=tools)
+    tool_call_text = (
+        '<|tool_call>call:get_weather{city:<|"|>Boston<|"|>}<tool_call|>'
+    )
+    tool_continuation = module._render_tool_continuation([
+        {
+            "role": "tool", "tool_call_id": "call_test",
+            "content": "72 F and sunny",
+        },
+    ], enable_thinking=False, pending_calls={"call_test": "get_weather"})
+    cached_tool_exchange = (
+        tool_initial.prompt + tool_call_text + "<|tool_response>" +
+        tool_continuation.prompt
+    )
+    assert cached_tool_exchange.endswith(
+        '<|tool_call>call:get_weather{city:<|"|>Boston<|"|>}<tool_call|>'
+        '<|tool_response>response:get_weather{value:<|"|>72 F and sunny<|"|>}'
+        '<tool_response|><|channel>thought\n<channel|>'
+    )
+    assert "<|channel>thought\n<channel|><|tool_call>" in cached_tool_exchange
+    user_continuation = module._render_tool_continuation([
+        {"role": "user", "content": "What about tomorrow?"},
+    ], enable_thinking=False, pending_calls={})
+    assert user_continuation.prompt == (
+        "\n<|turn>user\nWhat about tomorrow?<turn|>\n<|turn>model\n"
+        "<|channel>thought\n<channel|>"
+    )
+    literal_tool_value = 'source <bos> <|tool_response> <|"|>'
+    literal_tool_signature = module._tool_history_signature([{
+        "role": "tool", "tool_call_id": "call_test",
+        "content": literal_tool_value,
+    }])
+    assert json.loads(literal_tool_signature[0])["content"] == \
+        literal_tool_value
+    escaped_tool_continuation = module._render_tool_continuation([{
+        "role": "tool", "tool_call_id": "call_test",
+        "content": literal_tool_value,
+    }], enable_thinking=False, pending_calls={"call_test": "get_weather"})
+    assert "source <bos>" not in escaped_tool_continuation.prompt
+    assert "source \\u003cbos> \\u003c|tool_response> \\u003c|\"|>" in \
+        escaped_tool_continuation.prompt
+    retry_tool_continuation = module._render_tool_continuation([
+        {
+            "role": "tool", "tool_call_id": "call_test",
+            "content": literal_tool_value,
+        },
+        {"role": "user", "content": "Try Again"},
+    ], enable_thinking=False, pending_calls={"call_test": "get_weather"})
+    assert retry_tool_continuation == escaped_tool_continuation
+    escaped_assistant_replay = module.render_chat([
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "Literal <bos> and <channel|>"},
+        {"role": "user", "content": "Next"},
+    ], enable_thinking=False)
+    assert "Literal \\u003cbos> and \\u003cchannel|>" in \
+        escaped_assistant_replay.prompt
+    canonical_call_a = module._tool_history_signature([{
+        "role": "assistant", "content": None,
+        "tool_calls": [{
+            "id": "call_test", "type": "function",
+            "function": {
+                "name": "get_weather", "arguments": '{"city":"Boston"}',
+            },
+        }],
+    }])
+    canonical_call_b = module._tool_history_signature([{
+        "role": "assistant", "content": "", "reasoning_content": "hidden",
+        "tool_calls": [{
+            "id": "call_test", "type": "function",
+            "function": {
+                "name": "get_weather", "arguments": {"city": "Boston"},
+            },
+        }],
+    }])
+    assert canonical_call_a == canonical_call_b
+    expect_request_error(
+        lambda: module._render_tool_continuation([
+            {
+                "role": "tool", "tool_call_id": "call_one",
+                "content": "first",
+            },
+        ], enable_thinking=False, pending_calls={
+            "call_one": "first_tool", "call_two": "second_tool",
+        }),
+        "answer every pending tool call",
+    )
+
     thought = module.render_chat([
         {"role": "system", "content": "Be exact."},
         {"role": "user", "content": "2+2?"},
@@ -583,6 +681,19 @@ def main() -> None:
     assert direct.completion_tokens == 2
     assert direct.finish_reason == "stop"
 
+    # Generated assistant text is recorded as opaque validated output. A
+    # control-token spelling must not turn a committed streaming response into
+    # a post-decode client-input validation error.
+    generated_control = runner_fixture("text", "Literal <bos> spelling.")
+    generated_signature = module._tool_result_history_signature(
+        generated_control
+    )
+    assert json.loads(generated_signature)["content"] == \
+        "Literal <bos> spelling."
+    assert module._tool_history_signature([{
+        "role": "assistant", "content": "Literal <bos> spelling.",
+    }]) == (generated_signature,)
+
     tool_result = runner_fixture(
         "text",
         '<|tool_call>call:get_weather{city:<|"|>Boston<|"|>,days:2}'
@@ -595,6 +706,13 @@ def main() -> None:
     assert tool_result.tool_calls[0].name == "get_weather"
     assert tool_result.tool_calls[0].arguments == '{"city":"Boston","days":2}'
     assert tool_result.tool_calls[0].id.startswith("call_")
+    assert module._tool_result_history_signature(tool_result) == \
+        module._tool_history_signature([{
+            "role": "assistant", "content": tool_result.content,
+            "tool_calls": [
+                call.as_dict() for call in tool_result.tool_calls
+            ],
+        }])[0]
     streamed_deltas: list[tuple[str, str]] = []
     accumulator = module.NativeV2Accumulator(
         lambda kind, value: streamed_deltas.append((kind, value)),

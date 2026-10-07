@@ -350,7 +350,11 @@ def test_gemma_platform_recipes():
     assert metal["SALT_GPU_TRUNK_SHARED_POOL"] == "1", metal
     assert metal["SALT_GEMMA_METAL_EXACT_CELLS"] == "0", metal
     assert metal["SALT_TARGET_AREA_WORKERS"] == "8", metal
-    assert metal["SALT_PREFILL_B"] == "512", metal
+    assert metal["SALT_PREFILL_B"] == "1024", metal
+    assert metal["SALT_GPU_PREFILL_B"] == "1024", metal
+    assert metal["SALT_GPU_B_QKV"] == "1024", metal
+    assert metal["SALT_GPU_B_Z"] == "1024", metal
+    assert metal["SALT_GPU_B_O"] == "1024", metal
     assert metal["SALT_TARGET_GPU_PROGRAM"] == "1", metal
     assert metal["SALT_GEMMA_GPU_KV_RING"] == "1", metal
     assert metal["SALT_GEMMA_MEMORY_LIMIT_GB"] == "4.5", metal

@@ -9,8 +9,16 @@ salt_start() {
     "${SALT_REPO_ROOT:-/Users/her2/projects/SALT-core}/tools/salt-start.sh" "$@"
 }
 
-# Short form: st "your prompt"
+# Short forms:
+#   st start
+#   st restart
+#   st logs
+#   st "your prompt"
 st() {
+    if [[ ${1:-} == "start" || ${1:-} == "restart" || ${1:-} == "logs" ]]; then
+        salt_start "$@"
+        return
+    fi
     salt_talk "$@"
 }
 
