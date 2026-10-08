@@ -186,6 +186,7 @@ def main() -> None:
         [
             {"role": "system", "content": "stable policy"},
             {"role": "user", "content": "stable Copilot workspace context"},
+            {"role": "assistant", "content": "stable assistant response"},
             {"role": "user", "content": "variable user question"},
         ],
         enable_thinking=False,
@@ -203,6 +204,7 @@ def main() -> None:
         headroom.prefix_candidates[0]
     assert "stable Copilot workspace context" in \
         headroom.prefix_candidates[1]
+    assert "stable assistant response" in headroom.prefix_candidates[1]
     assert "variable user question" not in headroom.prefix_candidates[1]
     assert headroom.prompt[len(headroom.prefix or ""):].startswith(
         "<|turn>user\nvariable user question"
@@ -384,6 +386,8 @@ def main() -> None:
         assert exported["id"] == "session-one"
         assert exported["position"] == 1
         assert exported["legacy_read_only"] is False
+        assert exported["session_manifest"]["state_sha256"] == "a" * 64
+        assert exported["session_manifest"]["facts_sha256"] == "b" * 64
         assert len(backend.cache_store.list_caches()) == 1
         assert exported["storage_format"] == "payload-with-sidecar"
         artifact = backend.cache_store.load_metadata("session-one")
@@ -555,6 +559,22 @@ def main() -> None:
             prefixed.prefix.encode("utf-8")
         )
         assert prefix_record["tool_config"] == "tools-v1"
+        prefix_backend.cache_store.pin_copilot_prefix(
+            "copilot-default", prefix_metadata,
+        )
+        pinned_metadata, pinned_value = \
+            prefix_backend.cache_store.load_copilot_pin("copilot-default")
+        assert pinned_metadata.cache_id == prefix_cache_id
+        assert pinned_value["prefix_sha256"] == prefix_sha256
+        pin_path = prefix_backend.cache_store._copilot_pin_path(
+            "copilot-default"
+        )
+        pin_path.unlink()
+        discovered = prefix_backend.cache_store.discover_copilot_pin(
+            "copilot-default"
+        )
+        assert discovered is not None
+        assert discovered[0].cache_id == prefix_cache_id
 
         prefix_restored = module.Gemma4Backend(module.Gemma4Config(
             source_dir=root, pool=root, receipt=root,
@@ -604,7 +624,8 @@ def main() -> None:
         assert hierarchy_active.prompt == headroom.prompt[
             len(headroom.prefix or ""):
         ]
-        for candidate in headroom.prefix_candidates:
+        for candidate in (
+                headroom.prefix_candidates[0], headroom.prefix_candidates[-1]):
             digest = hashlib.sha256(
                 b"salt.gemma4.copilot-prefix.v1\0" +
                 candidate.encode("utf-8")
@@ -612,6 +633,61 @@ def main() -> None:
             assert hierarchy_backend.cache_store.contains(
                 hierarchy_backend._copilot_prefix_cache_id(digest)
             )
+
+        class HeadroomRestoreEngine(CopilotPrefixEngine):
+            def import_session_kv(self, path: Path, **values) -> dict:
+                assert path.is_file()
+                self.position = values["expected_position"]
+                self.state_sha256 = values["expected_state_sha256"]
+                self.facts_sha256 = values["expected_facts_sha256"]
+                return {
+                    "turn_id": values["turn_id"],
+                    "history_turns": values["history_turns"],
+                    "position": self.position,
+                    "state_sha256": self.state_sha256,
+                    "facts_sha256": self.facts_sha256,
+                }
+
+        continued_headroom = module.render_chat(
+            [
+                {"role": "system", "content": "stable policy"},
+                {"role": "user", "content": "stable Copilot workspace context"},
+                {"role": "assistant", "content": "stable assistant response"},
+                {"role": "user", "content": "variable user question"},
+                {"role": "user", "content": "next variable question"},
+            ],
+            enable_thinking=False,
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "lookup", "description": "Look up a value.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+        )
+        assert len(continued_headroom.prefix_candidates) == 3
+        continued_engine = HeadroomRestoreEngine()
+        continued_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=hierarchy_root,
+            copilot_cache_id="copilot-default",
+        ))
+        continued_backend.engine = continued_engine
+        continued_backend.cache_store = module.KVCacheStore(
+            hierarchy_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        continued_backend.build_identity_sha256 = prefix_build.hex()
+        continued_active = continued_backend._activate_copilot_prefix(
+            continued_headroom, "tools-v1",
+        )
+        assert continued_engine.prefill_prompts == [
+            continued_headroom.prefix_candidates[-1][
+                len(continued_headroom.prefix_candidates[-2]):
+            ],
+        ]
+        assert continued_active.prompt == continued_headroom.prompt[
+            len(continued_headroom.prefix or ""):
+        ]
 
         changed_headroom = module.render_chat(
             [
@@ -630,20 +706,6 @@ def main() -> None:
         )
         assert changed_headroom.prefix_candidates[0] == \
             headroom.prefix_candidates[0]
-
-        class HeadroomRestoreEngine(CopilotPrefixEngine):
-            def import_session_kv(self, path: Path, **values) -> dict:
-                assert path.is_file()
-                self.position = values["expected_position"]
-                self.state_sha256 = values["expected_state_sha256"]
-                self.facts_sha256 = values["expected_facts_sha256"]
-                return {
-                    "turn_id": values["turn_id"],
-                    "history_turns": values["history_turns"],
-                    "position": self.position,
-                    "state_sha256": self.state_sha256,
-                    "facts_sha256": self.facts_sha256,
-                }
 
         changed_engine = HeadroomRestoreEngine()
         changed_backend = module.Gemma4Backend(module.Gemma4Config(
@@ -666,6 +728,48 @@ def main() -> None:
         ]
         assert changed_active.prompt == changed_headroom.prompt[
             len(changed_headroom.prefix or ""):
+        ]
+
+        pinned_root = root / "copilot-pinned-exports"
+        pinned_source = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=pinned_root,
+            copilot_cache_id="copilot-default",
+        ))
+        pinned_source.engine = CopilotPrefixEngine()
+        pinned_source.cache_store = module.KVCacheStore(
+            pinned_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        pinned_source.build_identity_sha256 = prefix_build.hex()
+        pinned_source._activate_copilot_prefix(headroom, "tools-v1")
+        pinned_metadata, pinned_value = \
+            pinned_source.cache_store.load_copilot_pin("copilot-default")
+        pinned_engine = CopilotPrefixEngine()
+        pinned_engine.position = pinned_metadata.position
+        pinned_backend = module.Gemma4Backend(module.Gemma4Config(
+            source_dir=root, pool=root, receipt=root,
+            kv_cache_root=pinned_root,
+            copilot_cache_id="copilot-default",
+        ))
+        pinned_backend.engine = pinned_engine
+        pinned_backend.cache_store = module.KVCacheStore(
+            pinned_root, module.KV_COMPATIBILITY_SHA256, prefix_build,
+        )
+        pinned_backend.build_identity_sha256 = prefix_build.hex()
+        pinned_backend.shared_position = pinned_metadata.position
+        pinned_backend.mindset_end = pinned_metadata.position
+        pinned_backend.session_position = pinned_metadata.position
+        pinned_backend.copilot_pinned_prefix = pinned_value
+        pinned_active = pinned_backend._activate_copilot_prefix(
+            headroom, "tools-v1",
+        )
+        assert pinned_engine.prefill_prompts == [
+            headroom.prefix_candidates[-1][
+                len(headroom.prefix_candidates[0]):
+            ],
+        ]
+        assert pinned_active.prompt == headroom.prompt[
+            len(headroom.prefix or ""):
         ]
 
         runtime_root = root / "runtime-exports"

@@ -352,7 +352,7 @@ This table records current checked-in policy, not a universal optimum:
 | Recipe | Compute | PREFILL B | NFQ N/F/Q | X | Fine token | TARGET GPU | Expert budget | Memory ceiling |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | `mac` | CPU | 512 | N64/F1/Q4 | X64 | 0 | 0 | 1 GB | 4.5 GB |
-| `mac-metal` | Metal | 512 | N64/F1/Q4 | X64 | 0 | 1 | 1 GB | 4.5 GB |
+| `mac-metal` | Metal | 512 | N64/F1/Q4 | X4 | 0 | 1 | 1 GB | 4.5 GB |
 | `ec2` | CPU | 512 | N32/F1/Q4 | X32 | 0 | 0 | 6 GB | 14 GB |
 | `spark` | registered CUDA | 256 | N48/F1/Q4 | X48 | 0 | 1 | 13 GB, preload | 60 GB |
 | `spark-hmm` | pageable CUDA | 256 | N48/F1/Q4 | X48 | 1 | 1 | 2 GB | 16 GB |

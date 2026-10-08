@@ -155,6 +155,15 @@ _mentor_module = importlib.util.module_from_spec(_mentor_spec)
 sys.modules[_MENTOR_MODULE_NAME] = _mentor_module
 _mentor_spec.loader.exec_module(_mentor_module)
 
+_tools_spec = importlib.util.spec_from_file_location(
+    "salt_gemma4_function_tools", ROOT / "server/model/gemma4_tools.py",
+)
+if _tools_spec is None or _tools_spec.loader is None:
+    raise RuntimeError("cannot load Gemma 4 function-tool adapter")
+_tools = importlib.util.module_from_spec(_tools_spec)
+sys.modules[_tools_spec.name] = _tools
+_tools_spec.loader.exec_module(_tools)
+
 DEFAULT_MODEL_ID = "gemma-4-26b-a4b-it"
 GEMMA4_LEGACY_ROW_BYTES = 450_560
 GEMMA4_LAYERS = 30
@@ -178,6 +187,16 @@ _KV_LEGACY_COMPATIBILITY = {
 KV_LEGACY_V5_COMPATIBILITY_SHA256 = _KV_LEGACY_COMPATIBILITY["G4KVC005"]
 KV_LEGACY_V4_COMPATIBILITY_SHA256 = _KV_LEGACY_COMPATIBILITY["G4KVC004"]
 KV_CACHE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+EFFORT_OUTPUT = {
+    "none": 1_024,
+    "minimal": 1_024,
+    "low": 1_024,
+    "medium": 1_024,
+    "high": 1_024,
+}
+"""
+# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 EFFORT_OUTPUT = {
     "none": 128,
     "minimal": 128,
@@ -186,9 +205,7 @@ EFFORT_OUTPUT = {
     "high": 128,
 }
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-# Copilot omits all output-token aliases. Give unspecified requests enough
-# room to finish while retaining the configured native maximum as the ceiling.
-DEFAULT_UNSPECIFIED_OUTPUT_TOKENS = 1_024
+"""
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 THINKING_EFFORTS = {"low", "medium", "high"}
 IMAGE_SOFT_TOKENS = 64
@@ -200,6 +217,8 @@ RESERVED_PROMPT_TOKENS = (
     "<bos>", "<eos>", "<pad>", "<|turn>", "<turn|>",
     "<|channel>", "<channel|>", "<|think|>",
     IMAGE_BEGIN, IMAGE_TOKEN, IMAGE_END,
+    "<|tool>", "<tool|>", "<|tool_call>", "<tool_call|>",
+    "<|tool_response>", "<tool_response|>", '<|"|>',
 )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
 RESERVED_PROMPT_TOKENS += (
@@ -295,6 +314,63 @@ class RequestError(ValueError):
 
 class BackendError(RuntimeError):
     """An authenticated runner or server-internal failure."""
+
+
+class ToolOutputError(BackendError):
+    """A committed model reply failed the declared tool-output contract."""
+
+
+def _tool_config(body: dict):
+    try:
+        return _tools.validate_tools(body.get("tools"), body.get("tool_choice"),
+                                     body.get("parallel_tool_calls"))
+    except _tools.ToolFormatError as exc:
+        raise RequestError(str(exc)) from exc
+
+
+def _tool_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False,
+                      allow_nan=False, separators=(",", ":"))
+
+
+def _canonical_tool_message(message: dict) -> dict:
+    if set(message) - {"role", "content", "tool_calls", "reasoning_content"}:
+        raise RequestError("unsupported assistant tool-call message fields")
+    try:
+        _tools.render_assistant_calls(message.get("tool_calls"),
+                                      content=message.get("content"))
+        calls = []
+        for call in message["tool_calls"]:
+            function = call["function"]
+            calls.append({"id": call["id"], "type": "function", "function": {
+                "name": function["name"],
+                "arguments": _tool_json(_tools.loads_strict_json(function["arguments"])),
+            }})
+    except _tools.ToolFormatError as exc:
+        raise RequestError(str(exc)) from exc
+    return {"role": "assistant", "content": message.get("content") or None,
+            "tool_calls": calls}
+
+
+def _committed_tool_message(result: "RunnerResult", config) -> dict:
+    try:
+        parsed = _tools.parse_tool_output(result.content, config,
+                                          result.client_request_sha256)
+        yielded = result.stop_token == 50 and result.synthetic_close == 0
+        if bool(parsed.tool_calls) != yielded:
+            raise _tools.ToolFormatError("tool-call envelope/native yield boundary mismatch")
+    except _tools.ToolFormatError as exc:
+        raise ToolOutputError(str(exc)) from exc
+    message = {"role": "assistant", "content": parsed.content}
+    if parsed.tool_calls:
+        message["tool_calls"] = list(parsed.tool_calls)
+        try:
+            # Rendering/canonicalization is part of output validation, including
+            # replay. Its failure must not bypass native COMMIT bookkeeping.
+            return _canonical_tool_message(message)
+        except RequestError as exc:
+            raise ToolOutputError(str(exc)) from exc
+    return message
 
 
 def _run_process_group(command: list[str], *, timeout: float,
@@ -883,7 +959,7 @@ class PersistentGemmaEngine:
                     fields = _exact_fields(line, marker.decode(), self.READY_KEYS)
                     if self.ready.is_set():
                         raise BackendError("duplicate persistent V2 READY")
-                    if (_canonical_uint(fields["protocol"], "protocol") != 3 or
+                    if (_canonical_uint(fields["protocol"], "protocol") not in (3, 4, 5, 6) or
                             _canonical_uint(fields["model_context_limit"],
                                             "model_context_limit") !=
                             GEMMA4_MODEL_MAX_CONTEXT or
@@ -939,6 +1015,7 @@ class PersistentGemmaEngine:
                         file=sys.stderr, flush=True,
                     )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+                    self.protocol_version = int(fields["protocol"])
                     self.session_epoch = _canonical_uint(
                         fields["session_epoch"], "session_epoch")
                     self.output_limit = _canonical_uint(
@@ -1215,12 +1292,34 @@ class PersistentGemmaEngine:
                 on_delta: Callable[[str, str], None],
                 on_token: Callable[[int, int, bool], None] | None = None,
                 proof_state: bool = False,
+                tool_mode: bool = False,
+                input_mode: bool = False,
+                proposal_history_ids: tuple[int, ...] = (),
                 ) -> RunnerResult:
         if self.closed or self.process.poll() is not None or self.phase != "READY":
             raise BackendError("persistent Gemma V2 engine is not ready")
         if not isinstance(output_limit, int) or isinstance(output_limit, bool) or \
                 output_limit < 1 or output_limit > self.output_limit:
             raise RequestError("request output limit exceeds native server capacity")
+        if not isinstance(tool_mode, bool):
+            raise RequestError("tool_mode must be a boolean")
+        if tool_mode and getattr(self, "protocol_version", 3) < 4:
+            raise RequestError("native runner must be rebuilt for function-tool turns")
+        if not isinstance(input_mode, bool):
+            raise RequestError("input_mode must be a boolean")
+        if input_mode and getattr(self, "protocol_version", 3) < 5:
+            raise RequestError("OpenAI input mode requires a V5 runner")
+        if (not isinstance(proposal_history_ids, tuple) or
+                len(proposal_history_ids) > self.expected_context or
+                len(proposal_history_ids) > expected_position or
+                any(isinstance(token, bool) or not isinstance(token, int) or
+                    token < 0 or token > 0x7fffffff
+                    for token in proposal_history_ids)):
+            raise RequestError("invalid native proposal history")
+        if proposal_history_ids and getattr(self, "protocol_version", 3) < 6:
+            raise RequestError("conversation history proposals require a V6 runner")
+        if proposal_history_ids and input_mode:
+            raise RequestError("conversation history proposals require stateful mode")
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
         if self.sampler_abi not in (1, 2) or \
                 re.fullmatch(r"[0-9a-f]{8}", self.temperature_bits) is None or \
@@ -1244,6 +1343,9 @@ class PersistentGemmaEngine:
         )
         prompt_bytes = prompt.encode("utf-8")
         image_bytes = b"" if image_path is None else os.fsencode(image_path)
+        history_bytes = struct.pack(
+            f"<{len(proposal_history_ids)}I", *proposal_history_ids,
+        ) if proposal_history_ids else b""
         if not prompt_bytes or len(prompt_bytes) > MAX_PROMPT_BYTES or \
                 len(image_bytes) > 4096:
             raise RequestError("persistent V2 request frame exceeds private limits")
@@ -1290,9 +1392,35 @@ class PersistentGemmaEngine:
             f"request_sha256={request_sha256}\n"
         ).encode("ascii")
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
-        self._write_command(header + prompt_bytes + image_bytes + b"\n")
+        if proposal_history_ids:
+            header = (
+                f"SALT_GEMMA4_TURN_V6 request={request_id} "
+                f"session_epoch={expected_epoch} turn_id={expected_turn} "
+                f"history_turns={expected_history_turns} "
+                f"position={expected_position} prompt_bytes={len(prompt_bytes)} "
+                f"image_path_bytes={len(image_bytes)} "
+                f"proposal_history_count={len(proposal_history_ids)} "
+                f"output_limit={output_limit} proof_state={1 if proof_state else 0} "
+                f"sampler_abi={self.sampler_abi} "
+                f"temperature_bits={self.temperature_bits} "
+                f"seed={self.sampler_seed} top_k={self.sampler_top_k} "
+                f"tool_mode={int(tool_mode)} input_mode={int(input_mode)} "
+                f"client_request_sha256={client_request_sha256} "
+                f"request_sha256={request_sha256}\n"
+            ).encode("ascii")
+        elif input_mode:
+            header = header.replace(b"SALT_GEMMA4_TURN_V3 ", b"SALT_GEMMA4_TURN_V5 ", 1)
+            header = header.replace(b"client_request_sha256=",
+                f"tool_mode={int(tool_mode)} input_mode=1 client_request_sha256=".encode("ascii"), 1)
+        elif tool_mode:
+            header = header.replace(b"SALT_GEMMA4_TURN_V3 ", b"SALT_GEMMA4_TURN_V4 ", 1)
+            header = header.replace(b"client_request_sha256=", b"tool_mode=1 client_request_sha256=", 1)
+        self._write_command(
+            header + prompt_bytes + image_bytes + history_bytes + b"\n",
+        )
         accumulator = NativeV2Accumulator(on_delta)
         started = False
+        input_tokens = None
         self.last_dpr_result = None
         memory_snapshots: list[dict[str, str]] = []
         dpr_prefill_result: dict[str, str] | None = None
@@ -1339,6 +1467,7 @@ class PersistentGemmaEngine:
                             not _runtime_ready_field(fields["runtime_ready"])):
                         raise BackendError("persistent V2 START drift")
                     started = True
+                    input_tokens = _canonical_uint(fields["prompt_tokens"], "prompt_tokens")
                     self.phase = "STARTED"
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
                     self.active_prompt_tokens = _canonical_uint(
@@ -1685,7 +1814,7 @@ class PersistentGemmaEngine:
                     fields, payload = cast(tuple[dict[str, str], bytes], value)
                     result = self._result(
                         request_id, expected_epoch, expected_turn,
-                        expected_position, payload, fields,
+                        None if input_mode else expected_position, payload, fields,
                         expected_image_tokens=IMAGE_SOFT_TOKENS if image_path else 0,
                         expected_client_request_sha256=client_request_sha256,
                         expected_request_sha256=request_sha256,
@@ -1696,7 +1825,13 @@ class PersistentGemmaEngine:
                         expected_mindset_end=self.mindset_end,
                         expected_mindset_sha256=self.mindset_sha256,
                         replayed=False,
+                        tool_mode=tool_mode,
                     )
+                    if input_mode and (
+                            result.kv_loaded_tokens > expected_position or
+                            result.kv_loaded_tokens + result.prompt_tokens != input_tokens or
+                            result.kv_saved_tokens > self.expected_context):
+                        raise BackendError("OpenAI native prefix/position accounting drift")
                     proof_active = self.process_proof_state or proof_state
                     zero_digest = "0" * 64
                     if ((result.state_sha256 != zero_digest) != proof_active or
@@ -1739,6 +1874,7 @@ class PersistentGemmaEngine:
                         expected_mindset_end=self.mindset_end,
                         expected_mindset_sha256=self.mindset_sha256,
                         replayed=True,
+                        tool_mode=tool_mode,
                     )
                     self._emit_replay_deltas(result, on_start, on_delta)
                     self.last_committed_request_id = result.client_request_sha256
@@ -2195,7 +2331,8 @@ class PersistentGemmaEngine:
 
     def replay(self, *, client_request_sha256: str, request_sha256: str,
                on_start: Callable[[], None],
-               on_delta: Callable[[str, str], None]) -> RunnerResult:
+               on_delta: Callable[[str, str], None],
+               tool_mode: bool = False) -> RunnerResult:
         if self.closed or self.process.poll() is not None or self.phase != "READY":
             raise BackendError("persistent Gemma V2 engine is not ready")
         client_request_sha256 = self._identity_digest(
@@ -2236,6 +2373,7 @@ class PersistentGemmaEngine:
                         expected_mindset_end=self.mindset_end,
                         expected_mindset_sha256=self.mindset_sha256,
                         replayed=True,
+                        tool_mode=tool_mode,
                     )
                     self._emit_replay_deltas(result, on_start, on_delta)
                     self.last_committed_request_id = result.client_request_sha256
@@ -2278,7 +2416,7 @@ class PersistentGemmaEngine:
                 expected_build_identity_sha256: str,
                 expected_mindset_end: int,
                 expected_mindset_sha256: str,
-                replayed: bool) -> RunnerResult:
+                replayed: bool, tool_mode: bool = False) -> RunnerResult:
         if not _runtime_ready_field(fields["runtime_ready"]):
             raise BackendError("persistent V2 result readiness drift")
         if (_canonical_uint(fields["request"], "request") != request_id or
@@ -2352,18 +2490,10 @@ class PersistentGemmaEngine:
         if position_after != (
                 position_before + prompt_tokens + output_steps + synthetic_close):
             raise BackendError("persistent V2 committed-position drift")
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+        natural_boundary = stop_token == 106 or (tool_mode and stop_token == 50)
         if fields["session_continuable"] != "1" or \
-                (synthetic_close == 0) != (stop_token in (50, 106)):
+                (synthetic_close == 0) != natural_boundary:
             raise BackendError("persistent V2 continuation/turn-close drift")
-        """
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
-        if fields["session_continuable"] != "1" or \
-                (synthetic_close == 0) != (stop_token == 106):
-            raise BackendError("persistent V2 continuation/turn-close drift")
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-        """
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         try:
             output_ids = tuple(int(item) for item in fields["output_ids"].split(","))
         except ValueError as exc:
@@ -2718,6 +2848,8 @@ class Completion:
     elapsed_s: float
     kv_cache: KVCacheOutcome
     mentor_state: dict | None = None
+    # Presentation only: retain raw native bytes/digests in RunnerResult.
+    tool_message: dict | None = None
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
 
     def __post_init__(self) -> None:
@@ -3125,6 +3257,171 @@ class KVCacheStore:
                 raise RequestError(f"KV cache {cache_id!r}: {exc}") from exc
         return self._framed_delete(cache_id) or deleted
 
+    def _copilot_pin_path(self, owner_cache_id: str) -> Path:
+        self._request({"mode": "load", "id": owner_cache_id})
+        return self.root / f".{owner_cache_id}.pinned-prefix.json"
+
+    @staticmethod
+    def _copilot_prefix_record(metadata: KVCacheMetadata) -> dict | None:
+        envelope = metadata.metadata
+        inference = (
+            envelope.get("inference") if isinstance(envelope, dict) else None
+        )
+        prefix = (
+            inference.get("copilot_prefix")
+            if isinstance(inference, dict) else None
+        )
+        required = {
+            "schema", "prefix_sha256", "prefix_bytes", "tool_config",
+            "mindset_end", "state_sha256", "facts_sha256",
+        }
+        if (not isinstance(prefix, dict) or set(prefix) != required or
+                prefix.get("schema") != "salt.gemma4.copilot-prefix.v1" or
+                not isinstance(prefix.get("prefix_bytes"), int) or
+                prefix["prefix_bytes"] < 1 or
+                re.fullmatch(
+                    r"[0-9a-f]{64}", str(prefix.get("prefix_sha256", "")),
+                ) is None or
+                not isinstance(prefix.get("tool_config"), str)):
+            return None
+        return prefix
+
+    def pin_copilot_prefix(
+            self, owner_cache_id: str,
+            metadata: KVCacheMetadata) -> dict:
+        prefix = self._copilot_prefix_record(metadata)
+        expected_prefix = owner_cache_id + "-prefix-"
+        if (prefix is None or not metadata.cache_id.startswith(expected_prefix) or
+                metadata.position < 1 or
+                metadata.context_tokens < metadata.position or
+                metadata.build_identity_sha256 !=
+                    self.build_identity_sha256.hex()):
+            raise BackendError("invalid Copilot pinned-prefix artifact")
+        value = {
+            "schema": "salt.gemma4.copilot-pinned-prefix.v1",
+            "owner_cache_id": owner_cache_id,
+            "cache_id": metadata.cache_id,
+            "context_tokens": metadata.context_tokens,
+            "position": metadata.position,
+            "build_identity_sha256": metadata.build_identity_sha256,
+            "logical_state_sha256": metadata.logical_state_sha256,
+            "prefix_sha256": prefix["prefix_sha256"],
+            "prefix_bytes": prefix["prefix_bytes"],
+            "tool_config": prefix["tool_config"],
+        }
+        target = self._copilot_pin_path(owner_cache_id)
+        rendered = (json.dumps(value, sort_keys=True, separators=(",", ":")) +
+                    "\n").encode("utf-8")
+        if target.exists():
+            try:
+                if target.read_bytes() == rendered:
+                    return value
+            except OSError:
+                pass
+        temporary = self._temporary_path(owner_cache_id + "-pin")
+        try:
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                    getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(rendered)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            directory_fd = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return value
+
+    def load_copilot_pin(
+            self, owner_cache_id: str) -> tuple[KVCacheMetadata, dict] | None:
+        path = self._copilot_pin_path(owner_cache_id)
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or
+                    (hasattr(os, "geteuid") and info.st_uid != os.geteuid()) or
+                    stat.S_IMODE(info.st_mode) & 0o077):
+                raise BackendError("Copilot pinned-prefix selector is not private")
+            raw = stream.read(64 * 1024 + 1)
+        if len(raw) > 64 * 1024:
+            raise BackendError("Copilot pinned-prefix selector exceeds limit")
+        try:
+            value = json.loads(raw)
+        except (UnicodeError, ValueError) as exc:
+            raise BackendError("invalid Copilot pinned-prefix selector") from exc
+        required = {
+            "schema", "owner_cache_id", "cache_id", "context_tokens",
+            "position", "build_identity_sha256", "logical_state_sha256",
+            "prefix_sha256", "prefix_bytes", "tool_config",
+        }
+        if (not isinstance(value, dict) or set(value) != required or
+                value.get("schema") != "salt.gemma4.copilot-pinned-prefix.v1" or
+                value.get("owner_cache_id") != owner_cache_id or
+                not isinstance(value.get("cache_id"), str)):
+            raise BackendError("invalid Copilot pinned-prefix selector")
+        metadata = self._metadata(
+            value["cache_id"], self._path(value["cache_id"]),
+            verify_payload=False,
+        )
+        prefix = self._copilot_prefix_record(metadata)
+        if (prefix is None or
+                value["context_tokens"] != metadata.context_tokens or
+                value["position"] != metadata.position or
+                value["build_identity_sha256"] !=
+                    metadata.build_identity_sha256 or
+                value["logical_state_sha256"] !=
+                    metadata.logical_state_sha256 or
+                value["prefix_sha256"] != prefix["prefix_sha256"] or
+                value["prefix_bytes"] != prefix["prefix_bytes"] or
+                value["tool_config"] != prefix["tool_config"]):
+            raise BackendError("Copilot pinned-prefix selector changed")
+        return metadata, value
+
+    def discover_copilot_pin(
+            self, owner_cache_id: str) -> tuple[KVCacheMetadata, dict] | None:
+        groups: dict[str, list[tuple[str, KVCacheMetadata]]] = {}
+        prefix_name = owner_cache_id + "-prefix-"
+        for metadata in self.list_caches():
+            if not metadata.cache_id.startswith(prefix_name):
+                continue
+            prefix = self._copilot_prefix_record(metadata)
+            if (prefix is None or metadata.context_tokens < metadata.position or
+                    metadata.build_identity_sha256 !=
+                        self.build_identity_sha256.hex()):
+                continue
+            envelope = metadata.metadata or {}
+            created_at = str(envelope.get("created_at", ""))
+            groups.setdefault(prefix["tool_config"], []).append(
+                (created_at, metadata)
+            )
+        if not groups:
+            return None
+        # Select the tool declaration family used most recently, then its
+        # shortest prompt.  That is the stable system/tool head, not a
+        # conversation-specific descendant.
+        newest_group = max(
+            groups.values(), key=lambda items: max(created for created, _ in items),
+        )
+        metadata = min(
+            (item for _, item in newest_group),
+            key=lambda item: cast(dict, self._copilot_prefix_record(item))[
+                "prefix_bytes"
+            ],
+        )
+        value = self.pin_copilot_prefix(owner_cache_id, metadata)
+        return metadata, value
+
     _path = _sidecar_path
     _metadata = _sidecar_metadata
     publish = _sidecar_publish
@@ -3172,6 +3469,7 @@ class Gemma4Config:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     image_root: Path | None = None
     kv_cache_root: Path | None = None
+    session_mode: str = "stateful"
 
 
 class Gemma4AuthenticationAuthority:
@@ -3384,12 +3682,6 @@ def resolve_controls(body: dict, *, server_kv_budget_gb: float,
         explicit_output if explicit_output is not None
         else min(EFFORT_OUTPUT[effort], max_output_tokens)
     )
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-    if explicit_output is None:
-        output_tokens = min(
-            DEFAULT_UNSPECIFIED_OUTPUT_TOKENS, max_output_tokens,
-        )
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     if output_tokens > max_output_tokens:
         raise RequestError(
             f"requested output cap exceeds server maximum {max_output_tokens} tokens"
@@ -3428,12 +3720,12 @@ def resolve_controls(body: dict, *, server_kv_budget_gb: float,
     )
 
 
-def _client_text(value: str) -> str:
+def _client_text(value: str, *, preserve: bool = False) -> str:
     if "\0" in value:
         raise RequestError("message content contains NUL")
     if any(token in value for token in RESERVED_PROMPT_TOKENS):
         raise RequestError("message content contains a reserved Gemma control token")
-    return value.strip()
+    return value if preserve else value.strip()
 
 
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
@@ -3644,7 +3936,7 @@ def _tool_prompt_parts(tools: list[dict[str, object]],
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
 def _text_and_image_parts(content: object, role: str) -> tuple[str, str | None]:
     if isinstance(content, str):
-        return _client_text(content), None
+        return _client_text(content, preserve=role == "tool"), None
     if not isinstance(content, list):
         raise RequestError("message content must be a string or content-part array")
     rendered: list[str] = []
@@ -3662,7 +3954,7 @@ def _text_and_image_parts(content: object, role: str) -> tuple[str, str | None]:
             text = part.get("text")
             if not isinstance(text, str):
                 raise RequestError("text content part requires string text")
-            rendered.append(_client_text(text))
+            rendered.append(_client_text(text, preserve=role == "tool"))
             continue
         if part_type in ("image_url", "input_image", "image"):
             if role != "user":
@@ -3694,11 +3986,13 @@ def _text_and_image_parts(content: object, role: str) -> tuple[str, str | None]:
             rendered.append(IMAGE_BLOCK)
             continue
         raise RequestError(f"unsupported content part type: {part_type!r}")
-    return "".join(rendered).strip(), image_url
+    text = "".join(rendered)
+    return (text if role == "tool" else text.strip()), image_url
 
 
 def render_chat(messages: object, *, enable_thinking: bool,
-                continuation: bool = False) -> RenderedChat:
+                continuation: bool = False,
+                tool_declarations: str = "") -> RenderedChat:
     """Render a full Gemma chat or one user-turn continuation."""
     if not isinstance(messages, list) or not messages:
         raise RequestError("messages required")
@@ -3714,6 +4008,8 @@ def render_chat(messages: object, *, enable_thinking: bool,
         if not text:
             raise RequestError("cache continuation user message has no supported content")
         chunks = ["\n<|turn>user\n", text, "<turn|>\n<|turn>model\n"]
+        if tool_declarations:
+            chunks.insert(0, "\n<|turn>system\n" + tool_declarations + "<turn|>")
         if not enable_thinking:
             chunks.append("<|channel>thought\n<channel|>")
         prompt = "".join(chunks)
@@ -3761,6 +4057,8 @@ def render_chat(messages: object, *, enable_thinking: bool,
     if not turns or turns[-1][0] != "user":
         raise RequestError("the final chat message must be from the user")
 
+    if tool_declarations:
+        system_parts.append(tool_declarations)
     chunks = ["<bos>"]
     if system_parts or enable_thinking:
         chunks.append("<|turn>system\n")
@@ -3887,12 +4185,17 @@ def _render_tool_response(name: str, value: str) -> str:
 
 def render_chat(messages: object, *, enable_thinking: bool,
                 continuation: bool = False, tools: object = None,
-                tool_choice: object = None) -> RenderedChat:
+                tool_choice: object = None,
+                tool_declarations: str = "") -> RenderedChat:
     """Render a full Gemma chat or one user-turn continuation."""
     if not isinstance(messages, list) or not messages:
         raise RequestError("messages required")
+    if not isinstance(tool_declarations, str):
+        raise BackendError("rendered tool declarations must be text")
     normalized_tools = _normalize_tools(tools)
     normalized_choice = _normalize_tool_choice(tool_choice, normalized_tools)
+    if tool_declarations and normalized_tools:
+        raise BackendError("conflicting rendered tool declarations")
     if continuation:
         if normalized_tools or normalized_choice not in ("auto", "none"):
             raise RequestError("cache continuation does not support tools")
@@ -3907,6 +4210,8 @@ def render_chat(messages: object, *, enable_thinking: bool,
         if not text:
             raise RequestError("cache continuation user message has no supported content")
         chunks = ["\n<|turn>user\n", text, "<turn|>\n<|turn>model\n"]
+        if tool_declarations:
+            chunks.insert(0, "\n<|turn>system\n" + tool_declarations + "<turn|>")
         if not enable_thinking:
             chunks.append("<|channel>thought\n<channel|>")
         prompt = "".join(chunks)
@@ -3920,8 +4225,7 @@ def render_chat(messages: object, *, enable_thinking: bool,
     image_url: str | None = None
     seen_non_system = False
     body_chunks: list[str] = []
-    user_boundaries: list[int] = []
-    saw_conversation_history = False
+    user_starts: list[int] = []
     pending_calls: dict[str, str] | None = None
     answered_calls: set[str] = set()
     last_kind: str | None = None
@@ -3947,7 +4251,6 @@ def render_chat(messages: object, *, enable_thinking: bool,
             continue
         seen_non_system = True
         if role == "tool":
-            saw_conversation_history = True
             unknown = set(message) - {"role", "content", "tool_call_id", "name"}
             if unknown:
                 raise RequestError(
@@ -3990,11 +4293,10 @@ def render_chat(messages: object, *, enable_thinking: bool,
                 image_url = found_image
             if not text:
                 raise RequestError(f"message {index} has no supported content")
+            user_starts.append(len(body_chunks))
             body_chunks.extend(("<|turn>user\n", text, "<turn|>\n"))
-            user_boundaries.append(len(body_chunks))
             last_kind = "user"
             continue
-        saw_conversation_history = True
         unknown = set(message) - {
             "role", "content", "reasoning_content", "reasoning", "tool_calls",
             "refusal",
@@ -4051,6 +4353,8 @@ def render_chat(messages: object, *, enable_thinking: bool,
         raise RequestError("the final chat message must be from the user or a tool")
 
     chunks = ["<bos>"]
+    if tool_declarations:
+        system_parts.append(tool_declarations)
     tool_parts, choice_instruction = _tool_prompt_parts(
         normalized_tools, normalized_choice,
     )
@@ -4066,8 +4370,12 @@ def render_chat(messages: object, *, enable_thinking: bool,
         chunks.append("<turn|>\n")
     base_prefix = "".join(chunks)
     prefix_candidates = [base_prefix]
-    if not saw_conversation_history and last_kind == "user":
-        for boundary in user_boundaries[:-1]:
+    # Copilot resends the complete conversation on a cold/new connection.
+    # Every user-turn start is a possible previously cached rolling head.
+    # Keep the hierarchy for longest-prefix lookup; activation publishes only
+    # the newest head, so one request does not export every intermediate KV.
+    if last_kind == "user" and user_starts:
+        for boundary in user_starts:
             candidate = base_prefix + "".join(body_chunks[:boundary])
             if candidate != prefix_candidates[-1]:
                 prefix_candidates.append(candidate)
@@ -4258,6 +4566,72 @@ def _render_tool_continuation(
 
 
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+
+def render_tool_chat(messages: list[dict], *, enable_thinking: bool,
+                     config) -> RenderedChat:
+    """Render typed historical tool rounds without closing their model turn."""
+    signature = Gemma4Backend._history_signature(messages)
+    systems = []
+    chunks = []
+    pending = None
+    model_open = False
+    image_url = None
+    for role, text, image in signature:
+        if role in ("system", "developer"):
+            if chunks:
+                raise RequestError("system/developer messages must precede chat turns")
+            systems.append(text)
+        elif role == "user":
+            if pending is not None or model_open:
+                raise RequestError("tool round must finish before a new user turn")
+            if image is not None:
+                if image_url is not None:
+                    raise RequestError("Gemma 4 supports exactly one image per request")
+                image_url = image
+            chunks.extend(("<|turn>user\n", text, "<turn|>\n"))
+        elif role == "assistant_tool":
+            if pending is not None:
+                raise RequestError("tool calls require results before another assistant message")
+            message = json.loads(text)
+            pending = message["tool_calls"]
+            if not model_open:
+                chunks.append("<|turn>model\n")
+            chunks.append(_tools.render_assistant_calls(pending, content=message["content"]))
+            model_open = True
+        elif role == "tool":
+            if pending is None:
+                raise RequestError("tool result has no preceding assistant tool call")
+            try:
+                chunks.append(_tools.render_tool_results(json.loads(text), pending))
+            except _tools.ToolFormatError as exc:
+                raise RequestError(str(exc)) from exc
+            pending = None
+        else:
+            if pending is not None:
+                raise RequestError("missing tool results")
+            if not model_open:
+                chunks.append("<|turn>model\n")
+            chunks.extend((text, "<turn|>\n"))
+            model_open = False
+    if pending is not None or signature[-1][0] not in ("user", "tool"):
+        raise RequestError("chat must end with a user message or complete tool results")
+    declarations = _tools.render_declarations(config)
+    if declarations:
+        systems.append(declarations)
+    prefix = "<bos>"
+    if systems or enable_thinking:
+        prefix += "<|turn>system\n" + ("<|think|>\n" if enable_thinking else "")
+        prefix += "\n".join(systems) + "<turn|>\n"
+    if not model_open:
+        chunks.append("<|turn>model\n")
+        if not enable_thinking:
+            chunks.append("<|channel>thought\n<channel|>")
+    prompt = prefix + "".join(chunks)
+    if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise RequestError("rendered prompt exceeds private byte limit")
+    return RenderedChat(prompt, image_url)
+
+
 def _ppm_token(data: bytes, offset: int) -> tuple[bytes, int]:
     size = len(data)
     while offset < size:
@@ -4704,6 +5078,12 @@ class Gemma4Backend:
 
     def __init__(self, config: Gemma4Config,
                  authentication: Gemma4AuthenticationAuthority | None = None):
+        if config.session_mode not in ("stateful", "openai"):
+            raise BackendError("Gemma session mode must be stateful or openai")
+        if config.session_mode == "openai" and (
+                config.shared_kv is not None or config.mentor_root is not None or
+                config.mentor_anchor is not None or config.dpr_mode != "off"):
+            raise BackendError("OpenAI mode requires DPR off and no shared/mentor state")
         if not isinstance(config.context_tokens, int) or \
                 isinstance(config.context_tokens, bool) or \
                 config.context_tokens < 3 or \
@@ -4729,6 +5109,7 @@ class Gemma4Backend:
         self.config = config
         self.authentication = authentication
         self.lock = threading.Lock()
+        self.cancel_lock = threading.Lock()
         self.compatibility = KV_COMPATIBILITY
         self.cache_store = None
         self.engine: PersistentGemmaEngine | None = None
@@ -4755,6 +5136,8 @@ class Gemma4Backend:
         self.tool_pending_calls: dict[str, str] = {}
         self.tool_prefix_sha256: str | None = None
         self.copilot_prefix_export: dict[str, object] | None = None
+        self.copilot_pinned_prefix: dict[str, object] | None = None
+        self._copilot_shared_context = None
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
         self.committed_requests: OrderedDict[str, str] = OrderedDict()
         self.last_committed_request_id: str | None = None
@@ -4990,6 +5373,8 @@ class Gemma4Backend:
                 dpr_mode=self.config.dpr_mode,
                 initial_input=initial_input, pass_fds=inherited_fds,
             )
+            if self.config.session_mode == "openai" and self.engine.protocol_version < 5:
+                raise BackendError("OpenAI input mode requires a rebuilt V5 native runner")
             self.build_identity_sha256 = build_identity.hexdigest
             if self.config.kv_cache_root is not None:
                 self.cache_store = KVCacheStore(
@@ -5002,24 +5387,39 @@ class Gemma4Backend:
             self.history_turns = self.engine.history_turns
             self.session_position = self.engine.position
             self.shared_position = self.engine.shared_position
-            if (self.mentor_anchor_metadata is not None and
-                    self.shared_position != self.mentor_anchor_metadata.position):
-                self.engine.stop(force=True)
-                self.engine = None
-                raise BackendError("persistent mentor anchor position drift")
             self.state_sha256 = self.engine.state_sha256
             self.mindset_mode = self.engine.mindset_mode
             self.mindset_end = self.engine.mindset_end
             self.mindset_sha256 = self.engine.mindset_sha256
             self.facts_sha256 = self.engine.facts_sha256
             self.facts_rows = self.engine.facts_rows
-        except OSError as exc:
-            raise BackendError("could not start persistent Gemma engine") from exc
+            if (self.mentor_anchor_metadata is not None and
+                    self.shared_position != self.mentor_anchor_metadata.position):
+                self.engine.stop(force=True)
+                self.engine = None
+                raise BackendError("persistent mentor anchor position drift")
+        except BaseException as exc:
+            if self.engine is not None:
+                self.engine.stop(force=True)
+                self.engine = None
+            if self._copilot_shared_context is not None:
+                self._copilot_shared_context.__exit__(
+                    type(exc), exc, exc.__traceback__,
+                )
+                self._copilot_shared_context = None
+            self.copilot_pinned_prefix = None
+            if isinstance(exc, OSError):
+                raise BackendError("could not start persistent Gemma engine") from exc
+            raise
 
     def stop_persistent(self) -> None:
         if self.engine is not None:
             self.engine.stop()
             self.engine = None
+        if self._copilot_shared_context is not None:
+            self._copilot_shared_context.__exit__(None, None, None)
+            self._copilot_shared_context = None
+        self.copilot_pinned_prefix = None
 
     def export_kv(self, path: Path) -> dict:
         if self.engine is None:
@@ -5045,6 +5445,8 @@ class Gemma4Backend:
         return self.cache_store
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     def export_cache(self, cache_id: str, *, replace_existing: bool = False) -> dict:
+        if self.config.session_mode == "openai":
+            raise RequestError("conversation export requires stateful mode; use salt_proof_state for request proof")
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
         self._engage_cache_store()
         """
@@ -5116,6 +5518,8 @@ class Gemma4Backend:
                 "turn_id": self.turn_count,
                 "history_turns": self.history_turns,
                 "mindset_end": self.mindset_end,
+                "state_sha256": native["state_sha256"],
+                "facts_sha256": native["facts_sha256"],
                 "history": [
                     {"role": role, "content": content, "image_url": image_url}
                     for role, content, image_url in self.session_history
@@ -5344,10 +5748,31 @@ class Gemma4Backend:
             ).hexdigest(),
             len(candidate.encode("utf-8")),
         ) for candidate in candidates]
-        current_index: int | None = next((
-            index for index, (digest, _) in enumerate(identities)
-            if digest == self.tool_prefix_sha256
-        ), None)
+        current_index: int | None = None
+        pinned = self.copilot_pinned_prefix
+        if pinned is not None:
+            base_digest, base_bytes = identities[0]
+            if (self.shared_position != self.mindset_end or
+                    self.session_position != self.mindset_end or
+                    self.history_turns != 0):
+                raise BackendError(
+                    "Copilot pinned-prefix activation requires a clear suffix"
+                )
+            if (pinned.get("prefix_sha256") != base_digest or
+                    pinned.get("prefix_bytes") != base_bytes or
+                    pinned.get("tool_config") != tool_config or
+                    pinned.get("position") != self.mindset_end):
+                raise RequestError(
+                    "Copilot system/tool prefix changed from the resident "
+                    "pinned prefix; restart with a matching prefix"
+                )
+            self.tool_prefix_sha256 = base_digest
+            current_index = 0
+        if current_index is None:
+            current_index = next((
+                index for index, (digest, _) in enumerate(identities)
+                if digest == self.tool_prefix_sha256
+            ), None)
         if current_index is None:
             for index in range(len(candidates) - 1, -1, -1):
                 digest, byte_count = identities[index]
@@ -5371,8 +5796,11 @@ class Gemma4Backend:
                 progress_request_sha256=progress_request_sha256,
             )
             current_index = 0
-        while current_index + 1 < len(candidates):
-            next_index = current_index + 1
+        if current_index + 1 < len(candidates):
+            # Intermediate candidates exist only so lookup can find the
+            # longest head saved by an earlier request.  Extend that ancestor
+            # directly to the newest head and publish a single new snapshot.
+            next_index = len(candidates) - 1
             next_digest, _ = identities[next_index]
             extension = candidates[next_index][len(candidates[current_index]):]
             self._build_copilot_prefix(
@@ -5384,6 +5812,21 @@ class Gemma4Backend:
         prefix_sha256, _ = identities[-1]
         if self.tool_prefix_sha256 != prefix_sha256:
             raise BackendError("Copilot prefix activation did not establish authority")
+        if pinned is None:
+            base_digest, _ = identities[0]
+            base_cache_id = self._copilot_prefix_cache_id(base_digest)
+            store = self._engage_cache_store()
+            if store.contains(base_cache_id):
+                try:
+                    store.pin_copilot_prefix(
+                        cast(str, self.config.copilot_cache_id),
+                        store.load_metadata(base_cache_id),
+                    )
+                except (BackendError, RequestError, OSError, ValueError) as exc:
+                    print(
+                        f"[gemma4-cache] Copilot base pin failed: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
         if not rendered.prompt.startswith(prefix):
             raise BackendError("rendered Copilot prefix is not a prompt prefix")
         suffix = rendered.prompt[len(prefix):]
@@ -5413,6 +5856,8 @@ class Gemma4Backend:
             )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     def import_session_cache(self, cache_id: str, manifest: object) -> dict:
+        if self.config.session_mode == "openai":
+            raise RequestError("session import requires stateful mode")
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
         self._engage_cache_store()
         """
@@ -5454,9 +5899,21 @@ class Gemma4Backend:
             role = item["role"]
             content = item["content"]
             image_url = item["image_url"]
-            if (role not in ("user", "assistant") or not isinstance(content, str) or
+            if (role not in ("user", "assistant", "assistant_tool", "tool") or not isinstance(content, str) or
                     (image_url is not None and not isinstance(image_url, str))):
                 raise RequestError("invalid session history value")
+            if role in ("assistant_tool", "tool"):
+                if image_url is not None:
+                    raise RequestError("tool history cannot contain images")
+                try:
+                    parsed = _tools.loads_strict_json(content, field="tool history")
+                    if role == "assistant_tool":
+                        if _tool_json(_canonical_tool_message(parsed)) != content:
+                            raise RequestError("noncanonical assistant tool history")
+                    elif self._history_signature(parsed) != [("tool", content, None)]:
+                        raise RequestError("noncanonical tool result history")
+                except (ValueError, TypeError, KeyError) as exc:
+                    raise RequestError("invalid tool history") from exc
             history.append((role, content, image_url))
         if len(history) != history_turns * 2:
             raise RequestError("session history/turn count mismatch")
@@ -5467,9 +5924,11 @@ class Gemma4Backend:
         turns: list[dict[str, object]] = []
         for item in raw_turns:
             assert isinstance(item, dict)
-            if set(item) != {
+            base_fields = {
                     "turn_id", "prompt_ids", "output_ids", "response_sha256",
-                    "content", "output_limit"}:
+                    "content", "output_limit"}
+            tool_fields = {"tool_mode", "tools", "tool_yield", "tool_call_seed"}
+            if set(item) not in (base_fields, base_fields | tool_fields):
                 raise RequestError("invalid session turn provenance fields")
             item_turn = item["turn_id"]
             prompt_ids = item["prompt_ids"]
@@ -5489,9 +5948,39 @@ class Gemma4Backend:
                     re.fullmatch(r"[0-9a-f]{64}", item["response_sha256"]) is None):
                 raise RequestError("invalid session turn provenance values")
             previous_turn = item_turn
+            if tool_fields <= set(item):
+                if (type(item["tool_mode"]) is not bool or type(item["tool_yield"]) is not bool or
+                        not isinstance(item["tool_call_seed"], str) or
+                        re.fullmatch(r"[0-9a-f]{64}", item["tool_call_seed"]) is None or
+                        (item["tool_yield"] and (not item["tool_mode"] or output_ids[-1] != 50))):
+                    raise RequestError("invalid tool turn provenance")
+                config = _tool_config({"tools": item["tools"]})
+                if item["tool_yield"]:
+                    try:
+                        parsed = _tools.parse_tool_output(item["content"], config,
+                                                          item["tool_call_seed"])
+                        expected = {"role": "assistant", "content": parsed.content,
+                                    "tool_calls": list(parsed.tool_calls)}
+                        if not parsed.tool_calls or history[len(turns) * 2 + 1] != (
+                                "assistant_tool", _tool_json(expected), None):
+                            raise RequestError("tool call provenance/history mismatch")
+                    except _tools.ToolFormatError as exc:
+                        raise RequestError(str(exc)) from exc
             turns.append(dict(item))
         if turns and turns[-1]["turn_id"] != turn_id:
             raise RequestError("session turn provenance terminal turn mismatch")
+        for index in range(history_turns):
+            role, content, _ = history[index * 2]
+            if role == "tool":
+                if index == 0 or history[index * 2 - 1][0] != "assistant_tool":
+                    raise RequestError("tool history has no preceding call")
+                try:
+                    _tools.render_tool_results(json.loads(content),
+                        json.loads(history[index * 2 - 1][1])["tool_calls"])
+                except _tools.ToolFormatError as exc:
+                    raise RequestError(str(exc)) from exc
+            elif role != "user":
+                raise RequestError("invalid input role in session history")
         metadata = self.cache_store.load_metadata(cache_id)
         if (metadata.context_tokens != self.config.context_tokens or
                 metadata.logical_state_sha256 != state_sha256):
@@ -5563,6 +6052,27 @@ class Gemma4Backend:
         self.transport_records.clear()
         return self.session_status()
 
+    def cancel_active_request(self) -> dict[str, object]:
+        """Force-stop the native epoch without waiting on the request lock."""
+        with self.cancel_lock:
+            engine = self.engine
+            if (engine is None or engine.closed or
+                    engine.active_request is None):
+                return {
+                    "object": "salt.session.cancel",
+                    "cancelled": False,
+                    "request": None,
+                }
+            request_id = engine.active_request
+            client_request_id = engine.active_client_request_sha256
+            engine.stop(force=True)
+            return {
+                "object": "salt.session.cancel",
+                "cancelled": True,
+                "request": request_id,
+                "client_request_id": client_request_id,
+            }
+
     def reset_persistent(self) -> dict:
         return self.clear_facts()
 
@@ -5605,6 +6115,8 @@ class Gemma4Backend:
         return self.session_status()
 
     def reconfigure_dpr(self, control: object) -> dict:
+        if self.config.session_mode == "openai":
+            raise RequestError("DPR reconfiguration requires stateful mode")
         if self.engine is None or self.session_position != self.mindset_end or \
                 self.history_turns != 0:
             raise RequestError("DPR reconfiguration requires a clear READY session")
@@ -5699,7 +6211,8 @@ class Gemma4Backend:
         phase = self.engine.phase if self.engine is not None else "DOWN"
         return {
             "object": "salt.session",
-            "mode": "persistent-live-kv",
+            "mode": "implicit-prefix-cache" if self.config.session_mode == "openai" else "persistent-live-kv",
+            "session_mode": self.config.session_mode,
             "engine_running": engine_running,
             "turns": self.turn_count,
             "history_turns": self.history_turns,
@@ -5741,13 +6254,47 @@ class Gemma4Backend:
         if not isinstance(messages, list) or not messages:
             raise RequestError("messages required")
         signature: list[tuple[str, str, str | None]] = []
+        if len(messages) > 64:
+            raise RequestError("at most 64 messages are accepted")
+        tool_group: list[dict] = []
+        def flush_tools() -> None:
+            if tool_group:
+                identifiers = [item["tool_call_id"] for item in tool_group]
+                if len(set(identifiers)) != len(identifiers):
+                    raise RequestError("duplicate tool result call ID")
+                signature.append(("tool", _tool_json(sorted(
+                    tool_group, key=lambda item: item["tool_call_id"])), None))
+                tool_group.clear()
         for message in messages:
             if not isinstance(message, dict):
                 raise RequestError("messages must be objects")
             role = message.get("role")
+            if role == "tool":
+                if set(message) - {"role", "content", "tool_call_id", "name"}:
+                    raise RequestError("unsupported tool result message fields")
+                identifier = message.get("tool_call_id")
+                if not isinstance(identifier, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier) is None:
+                    raise RequestError("invalid tool_call_id")
+                text, image = _text_and_image_parts(message.get("content", ""), role)
+                if image is not None:
+                    raise RequestError("tool results must contain text only")
+                entry = {"role": "tool", "tool_call_id": identifier, "content": text}
+                if "name" in message:
+                    entry["name"] = message["name"]
+                tool_group.append(entry)
+                continue
+            flush_tools()
+            if role == "assistant" and message.get("tool_calls"):
+                signature.append(("assistant_tool", _tool_json(
+                    _canonical_tool_message(message)), None))
+                continue
             allowed = {"role", "content"}
             if role == "assistant":
                 allowed.add("reasoning_content")
+                if message.get("tool_calls") in (None, []):
+                    allowed.add("tool_calls")
+                if message.get("refusal") is None:
+                    allowed.add("refusal")
             unknown = set(message) - allowed
             if unknown:
                 raise RequestError(
@@ -5761,6 +6308,7 @@ class Gemma4Backend:
             if role != "assistant" and not text:
                 raise RequestError(f"{role} message has no supported content")
             signature.append((role, text, image_url))
+        flush_tools()
         return signature
 
     @staticmethod
@@ -5929,11 +6477,32 @@ class Gemma4Backend:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             "decode": "greedy",
             "streaming": "live-sse",
-            "sessions": "one-live-kv-session-per-launch",
-            "private_protocol": "gemma4-persistent-v3",
+            "session_mode": self.config.session_mode,
+            "sessions": ("complete-request-authority" if self.config.session_mode == "openai"
+                         else "one-live-kv-session-per-launch"),
+            "private_protocol": (
+                "gemma4-persistent-v6" if getattr(self.engine, "protocol_version", 3) >= 6 else
+                "gemma4-persistent-v5" if getattr(self.engine, "protocol_version", 3) >= 5 else
+                "gemma4-persistent-v4" if getattr(self.engine, "protocol_version", 3) >= 4
+                else "gemma4-persistent-v3"
+            ),
+            "conversation_history_proposals": (
+                self.config.session_mode == "stateful" and
+                getattr(self.engine, "protocol_version", 3) >= 6
+            ),
+            "openai_chat_completions": {
+                "text": True, "models": True, "usage": True,
+                "function_tools": getattr(self.engine, "protocol_version", 3) >= 4,
+                "tool_choice": ["none", "auto", "required", "named"],
+                "tool_argument_streaming": "commit-validated-buffered",
+                "tool_execution": "client-only", "strict_schema": False,
+                "tool_dpr_modes": ["off"],
+                "schema_keywords": ["type", "description", "title", "properties",
+                                    "required", "items", "additionalProperties", "enum", "default"],
+            },
             "idempotency": {
                 "header": "Idempotency-Key",
-                "automatic_immediate_retry": True,
+                "automatic_immediate_retry": self.config.session_mode == "stateful",
                 "native_journal_entries": 256,
                 "replay_mutates_state": False,
             },
@@ -5954,8 +6523,10 @@ class Gemma4Backend:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
                 "enabled": True,
                 "engaged": self.cache_store is not None,
-                "modes": ["export", "import"],
-                "selector": "server-owned-runtime-store",
+                "modes": (["implicit-prefix"] if self.config.session_mode == "openai"
+                          else ["export", "import"]),
+                "selector": ("exact-canonical-input-prefix" if self.config.session_mode == "openai"
+                             else "server-owned-runtime-store"),
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                 "portable_format": "G4KVC006",
                 "legacy_read_formats": ["G4KVC005", "G4KVC004"],
@@ -6046,9 +6617,7 @@ class Gemma4Backend:
                 "messages", "max_tokens", "max_completion_tokens",
                 "reasoning_effort", "modalities", "audio", "response_format",
                 "stream_options",
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-                "tool_choice",
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+                "tool_choice", "parallel_tool_calls",
             }
             label = "Chat"
             required = "messages"
@@ -6100,7 +6669,19 @@ class Gemma4Backend:
                     "unsupported reasoning fields: " +
                     ", ".join(sorted(nested_unknown))
                 )
-        Gemma4Backend._validate_sampling(body)
+        if endpoint == "chat":
+            tools = _normalize_tools(body.get("tools"))
+            _normalize_tool_choice(body.get("tool_choice"), tools)
+            parallel_tools = body.get("parallel_tool_calls")
+            if parallel_tools is not None and not isinstance(parallel_tools, bool):
+                raise RequestError("parallel_tool_calls must be boolean")
+            sampling = dict(body)
+            sampling.pop("tools", None)
+            sampling.pop("tool_choice", None)
+            sampling.pop("parallel_tool_calls", None)
+            Gemma4Backend._validate_sampling(sampling)
+        else:
+            Gemma4Backend._validate_sampling(body)
 
     @staticmethod
     def _validate_sampling(body: dict) -> None:
@@ -6304,7 +6885,7 @@ class Gemma4Backend:
             request_key, session_epoch=self.session_epoch,
             turn_id=self.turn_count, request_sha256=request_sha256,
         )
-        if request_key is None and self.turn_count > 0:
+        if self.config.session_mode == "stateful" and request_key is None and self.turn_count > 0:
             previous = _client_request_sha256(
                 None, session_epoch=self.session_epoch,
                 turn_id=self.turn_count - 1, request_sha256=request_sha256,
@@ -6324,6 +6905,33 @@ class Gemma4Backend:
             self.transport_records.popitem(last=False)
         return value
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
+    def _proposal_history_ids(self) -> tuple[int, ...]:
+        if (self.engine is None or self.engine.protocol_version < 6 or
+                not self.session_turns):
+            return ()
+        tokens: list[int] = []
+        for turn in self.session_turns:
+            prompt_ids = turn.get("prompt_ids")
+            output_ids = turn.get("output_ids")
+            if (not isinstance(prompt_ids, list) or
+                    not isinstance(output_ids, list) or
+                    any(isinstance(token, bool) or not isinstance(token, int) or
+                        token < 0 for token in [*prompt_ids, *output_ids])):
+                raise BackendError("invalid committed proposal history")
+            tokens.extend(prompt_ids)
+            tokens.extend(output_ids)
+            tool_yield = turn.get("tool_yield") is True
+            natural_close = bool(output_ids) and (
+                output_ids[-1] == 106 or
+                (tool_yield and output_ids[-1] == 50)
+            )
+            if not natural_close:
+                tokens.append(106)
+        facts_rows = self.session_position - self.mindset_end
+        if len(tokens) > facts_rows or len(tokens) > self.config.context_tokens:
+            raise BackendError("committed proposal history exceeds live KV")
+        return tuple(tokens)
+
     def _complete_tool_request(
             self, request_body: dict, controls: Controls, *,
             client_request_sha256: str, request_sha256: str,
@@ -6414,6 +7022,7 @@ class Gemma4Backend:
                 on_start=started, on_delta=delta,
                 on_token=on_native_token,
                 proof_state=strict_proof,
+                proposal_history_ids=self._proposal_history_ids(),
             )
         if result.replayed:
             self._remember_committed_request(
@@ -6492,12 +7101,52 @@ class Gemma4Backend:
         if (on_stream_start is None) != (on_stream_delta is None):
             raise BackendError("incomplete live-stream callback pair")
         self._validate_request_schema(body, endpoint=endpoint)
+        openai_mode = self.config.session_mode == "openai"
+        if openai_mode and endpoint != "chat":
+            raise RequestError("OpenAI input mode currently supports Chat Completions only")
         request_body = dict(body)
         if endpoint == "responses":
             request_body["messages"] = _responses_messages(body)
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-        tool_mode = endpoint == "chat" and _request_uses_tools(request_body)
-# SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
+        incoming_messages = request_body.get("messages")
+        tool_context = endpoint == "chat" and (
+            any(key in request_body for key in ("tools", "tool_choice", "parallel_tool_calls")) or
+            (isinstance(incoming_messages, list) and any(
+                isinstance(item, dict) and (item.get("role") == "tool" or item.get("tool_calls"))
+                for item in incoming_messages))
+        )
+        client_request_sha256, request_sha256 = self.resolve_request_identity(
+            body, endpoint, request_key,
+        )
+        known_request = self.committed_requests.get(client_request_sha256)
+        if known_request is not None and known_request != request_sha256:
+            raise RequestError("idempotency key payload mismatch")
+        if tool_context and known_request is not None and not openai_mode:
+            # Use the existing committed turn provenance, never today's inherited
+            # declarations, to interpret an older native journal result.
+            original_turn = next((turn for turn in reversed(self.session_turns)
+                if turn.get("tool_call_seed") == client_request_sha256), None)
+            if original_turn is None:
+                raise BackendError("committed tool request metadata unavailable for replay")
+            request_body["tools"] = original_turn["tools"]
+        elif tool_context and "tools" not in request_body and not openai_mode:
+            for previous in reversed(self.session_turns):
+                if previous.get("tool_mode"):
+                    request_body["tools"] = previous.get("tools", [])
+                    break
+        tool_config = None
+        if tool_context and openai_mode:
+            tool_config = _tool_config(request_body)
+            tool_mode = tool_config.enabled
+        elif tool_context:
+            stateful_tools = _normalize_tools(request_body.get("tools"))
+            stateful_choice = _normalize_tool_choice(
+                request_body.get("tool_choice"), stateful_tools,
+            )
+            tool_mode = bool(stateful_tools and stateful_choice != "none")
+        else:
+            tool_mode = False
+        if tool_context and self.config.dpr_mode != "off":
+            raise RequestError("function-tool turns currently require DPR off")
         model = request_body.get("model")
         if model is not None and model != self.config.model_id:
             raise RequestError(
@@ -6524,20 +7173,18 @@ class Gemma4Backend:
             )
         if self.engine is None:
             raise BackendError("persistent Gemma engine has not started")
-        client_request_sha256, request_sha256 = self.resolve_request_identity(
-            body, endpoint, request_key,
-        )
-        known_request = self.committed_requests.get(client_request_sha256)
-        if known_request is not None and known_request != request_sha256:
-            raise RequestError("idempotency key payload mismatch")
         started = on_stream_start or (lambda: None)
-        delta = on_stream_delta or (lambda _kind, _value: None)
+        public_delta = on_stream_delta or (lambda _kind, _value: None)
+        def delta(kind: str, value: str) -> None:
+            if not tool_context or kind == "reasoning_content":
+                public_delta(kind, value)
         t0 = time.monotonic()
         if known_request is not None:
             result = self.engine.replay(
                 client_request_sha256=client_request_sha256,
                 request_sha256=request_sha256,
                 on_start=started, on_delta=delta,
+                **({"tool_mode": True} if tool_mode else {}),
             )
             if not result.replayed:
                 raise BackendError("native replay did not return a replay result")
@@ -6546,14 +7193,18 @@ class Gemma4Backend:
                 modality="image" if result.image_tokens else "text",
                 elapsed_s=time.monotonic() - t0,
                 kv_cache=KVCacheOutcome(
-                    mode="live-replay", cache_id="launch",
+                    mode="prefix-replay" if openai_mode else "live-replay", cache_id="launch",
                     loaded_tokens=result.kv_loaded_tokens,
                     saved_tokens=result.kv_saved_tokens,
                 ),
                 mentor_state=self._mentor_public(),
+                tool_message=(
+                    _committed_tool_message(result, tool_config)
+                    if tool_config is not None else None
+                ),
             )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
-        if tool_mode:
+        if tool_mode and not openai_mode:
             return self._complete_tool_request(
                 request_body, controls,
                 client_request_sha256=client_request_sha256,
@@ -6562,16 +7213,33 @@ class Gemma4Backend:
                 on_native_token=on_native_token, t0=t0,
             )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
-        incoming_messages = request_body.get("messages")
         incoming_signature = self._history_signature(incoming_messages)
+        assert isinstance(incoming_messages, list)
+        pending_calls = None
+        if not openai_mode and self.session_turns and self.session_turns[-1].get("tool_yield"):
+            if not self.session_history or self.session_history[-1][0] != "assistant_tool":
+                raise RequestError("previous tool yield was malformed; clear the session before continuing")
+            pending_calls = json.loads(self.session_history[-1][1])["tool_calls"]
+        if pending_calls is not None and incoming_signature[-1][0] != "tool":
+            raise RequestError("pending tool calls require all tool results before a new user turn")
         history_after_user: list[tuple[str, str, str | None]]
         render_messages = incoming_messages
-        if self.history_turns > 0:
+        if openai_mode:
+            history_after_user = [item for item in incoming_signature
+                if item[0] in ("user", "assistant", "assistant_tool", "tool")]
+            # History validation admits these presentation-only assistant fields.
+            # Do not feed them to the plain chat renderer or treat them as text.
+            render_messages = [
+                {"role": item["role"], "content": item.get("content", "")}
+                if item.get("role") == "assistant" and not item.get("tool_calls")
+                else item for item in incoming_messages
+            ]
+        elif self.history_turns > 0:
             canonical_incoming = [
                 item for item in incoming_signature
-                if item[0] in ("user", "assistant")
+                if item[0] in ("user", "assistant", "assistant_tool", "tool")
             ]
-            if incoming_signature[-1][0] != "user":
+            if incoming_signature[-1][0] not in ("user", "tool"):
                 raise RequestError(
                     "persistent continuation must end with a new user message"
                 )
@@ -6584,7 +7252,7 @@ class Gemma4Backend:
                 history_after_user = self.session_history + incoming_signature
             elif (len(canonical_incoming) == len(self.session_history) + 1 and
                   canonical_incoming[:-1] == self.session_history and
-                  canonical_incoming[-1][0] == "user"):
+                  canonical_incoming[-1][0] in ("user", "tool")):
                 history_after_user = canonical_incoming
             else:
                 raise RequestError(
@@ -6596,14 +7264,30 @@ class Gemma4Backend:
         else:
             history_after_user = [
                 item for item in incoming_signature
-                if item[0] in ("user", "assistant")
+                if item[0] in ("user", "assistant", "assistant_tool", "tool")
             ]
-        rendered = render_chat(
-            render_messages,
-            enable_thinking=controls.enable_thinking,
-            continuation=self.session_position > 0,
-        )
-        if rendered.image_url is not None and self.session_position > 0:
+        if not openai_mode and self.history_turns > 0 and incoming_signature[-1][0] == "tool":
+            if pending_calls is None:
+                raise RequestError("tool result has no pending native tool call")
+            try:
+                rendered = RenderedChat(_tools.render_tool_results(
+                    json.loads(incoming_signature[-1][1]), pending_calls), None)
+            except _tools.ToolFormatError as exc:
+                raise RequestError(str(exc)) from exc
+        elif (openai_mode or self.history_turns == 0) and any(
+                item[0] in ("assistant_tool", "tool") for item in incoming_signature):
+            rendered = render_tool_chat(incoming_messages,
+                enable_thinking=controls.enable_thinking, config=tool_config)
+        else:
+            rendered = render_chat(
+                render_messages, enable_thinking=controls.enable_thinking,
+                continuation=not openai_mode and self.session_position > 0,
+                tool_declarations=(
+                    _tools.render_declarations(tool_config)
+                    if tool_config is not None else ""
+                ),
+            )
+        if rendered.image_url is not None and not openai_mode and self.session_position > 0:
             raise RequestError(
                 "images are supported only on the first persistent turn"
             )
@@ -6630,6 +7314,11 @@ class Gemma4Backend:
                 on_start=started, on_delta=delta,
                 on_token=on_native_token,
                 proof_state=strict_proof,
+                proposal_history_ids=(
+                    () if openai_mode else self._proposal_history_ids()
+                ),
+                **({"tool_mode": True} if tool_mode else {}),
+                **({"input_mode": True} if openai_mode else {}),
             )
         if result.replayed:
             self._remember_committed_request(
@@ -6640,13 +7329,15 @@ class Gemma4Backend:
                 modality="image" if result.image_tokens else "text",
                 elapsed_s=time.monotonic() - t0,
                 kv_cache=KVCacheOutcome(
-                    mode="live-replay", cache_id="launch",
+                    mode="prefix-replay" if openai_mode else "live-replay", cache_id="launch",
                     loaded_tokens=result.kv_loaded_tokens,
                     saved_tokens=result.kv_saved_tokens,
                 ),
                 mentor_state=self._mentor_public(),
+                tool_message=_committed_tool_message(result, tool_config) if tool_context else None,
             )
-        if result.kv_loaded_tokens != self.session_position:
+        if (result.kv_loaded_tokens > self.session_position if openai_mode else
+                result.kv_loaded_tokens != self.session_position):
             raise BackendError("persistent live-KV start position drift")
         if (result.session_epoch != self.session_epoch or
                 result.turn_id != self.turn_count + 1 or
@@ -6663,9 +7354,19 @@ class Gemma4Backend:
         self.mindset_end = result.mindset_end
         self.mindset_sha256 = result.mindset_sha256
         self.facts_rows = result.facts_rows
-        self.session_history = history_after_user + [
-            ("assistant", result.content, None),
-        ]
+        tool_message = None
+        tool_error = None
+        if tool_config is not None:
+            try:
+                tool_message = _committed_tool_message(result, tool_config)
+            except ToolOutputError as exc:
+                tool_error = exc
+        assistant_signature = (
+            ("assistant_tool", _tool_json(tool_message), None)
+            if tool_message and tool_message.get("tool_calls")
+            else ("assistant", result.content, None)
+        )
+        self.session_history = history_after_user + [assistant_signature]
         self.session_turns.append({
             "turn_id": result.turn_id,
             "prompt_ids": list(result.prompt_ids),
@@ -6674,19 +7375,34 @@ class Gemma4Backend:
             "content": result.content,
             "output_limit": controls.output_tokens,
         })
+        if tool_config is not None:
+            self.session_turns[-1].update({
+                "tool_mode": tool_mode,
+                "tools": json.loads(_tool_json(request_body.get("tools", []))),
+                "tool_yield": result.stop_token == 50 and result.synthetic_close == 0,
+                "tool_call_seed": result.client_request_sha256,
+            })
         self.last_user_signature = history_after_user[-1]
+        if openai_mode:
+            # Only the current request is conversation context. The existing
+            # bounded request-ID journal still handles explicit retries.
+            self.session_turns = self.session_turns[-1:]
         self._remember_committed_request(
             client_request_sha256, request_sha256,
         )
+        if tool_error is not None:
+            # Native COMMIT is final. Keep mirrors/journal; do not regenerate.
+            raise tool_error
         return Completion(
             result=result, controls=controls,
             modality="image" if rendered.image_url is not None else "text",
             elapsed_s=time.monotonic() - t0,
             kv_cache=KVCacheOutcome(
-                mode="live", cache_id="launch", loaded_tokens=result.kv_loaded_tokens,
+                mode="prefix" if openai_mode else "live", cache_id="launch", loaded_tokens=result.kv_loaded_tokens,
                 saved_tokens=result.kv_saved_tokens,
             ),
             mentor_state=self._mentor_public(),
+            tool_message=tool_message,
         )
 
 
@@ -6709,7 +7425,8 @@ def _sampler_payload(completion: Completion) -> dict:
 def _chat_payload(completion: Completion, *, model: str,
                   completion_id: str, created: int) -> dict:
     result = completion.result
-    message = {"role": "assistant", "content": result.content}
+    message = (dict(completion.tool_message) if completion.tool_message is not None
+               else {"role": "assistant", "content": result.content})
     if result.reasoning_content is not None:
         message["reasoning_content"] = result.reasoning_content
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
@@ -6725,7 +7442,7 @@ def _chat_payload(completion: Completion, *, model: str,
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": result.finish_reason,
+            "finish_reason": "tool_calls" if message.get("tool_calls") else result.finish_reason,
         }],
         "usage": {
             "prompt_tokens": completion.kv_cache.loaded_tokens + result.prompt_tokens,
@@ -6775,6 +7492,11 @@ def _chat_payload(completion: Completion, *, model: str,
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
     if completion.mentor_state is not None:
         payload["x_salt"]["mentor_state"] = completion.mentor_state
+    if completion.kv_cache.mode in ("prefix", "prefix-replay"):
+        payload["x_salt"]["session_mode"] = "openai"
+        payload["usage"]["prompt_tokens_details"] = {
+            "cached_tokens": completion.kv_cache.loaded_tokens,
+        }
     return payload
 
 
@@ -6935,6 +7657,8 @@ def handler_for(backend: Gemma4Backend):
             self._send_json(code, {"error": {
                 "message": message,
                 "type": error_type,
+                "param": None,
+                "code": None,
             }})
 
         def _framing_error(self, message: str):
@@ -7001,6 +7725,16 @@ def handler_for(backend: Gemma4Backend):
                     "x_salt": backend.capabilities(),
                 }]})
                 return
+            if path.startswith("/v1/models/"):
+                if unquote(path[len("/v1/models/"):]) != backend.config.model_id:
+                    self._error(404, "model not found", "invalid_request_error")
+                    return
+                self._send_json(200, {
+                    "id": backend.config.model_id, "object": "model",
+                    "created": 0, "owned_by": "salt",
+                    "x_salt": backend.capabilities(),
+                })
+                return
             if path == "/v1/session":
                 self._send_json(200, backend.session_status())
                 return
@@ -7034,8 +7768,18 @@ def handler_for(backend: Gemma4Backend):
             if len(raw) != length:
                 self._framing_error("truncated request body")
             try:
-                value = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                def unique_pairs(pairs):
+                    value = {}
+                    for key, item in pairs:
+                        if key in value:
+                            raise ValueError("duplicate JSON object key")
+                        value[key] = item
+                    return value
+                def reject_constant(value):
+                    raise ValueError("non-finite JSON number")
+                value = json.loads(raw, object_pairs_hook=unique_pairs,
+                                   parse_constant=reject_constant)
+            except (UnicodeDecodeError, ValueError, RecursionError) as exc:
                 raise RequestError(f"invalid JSON: {exc}") from exc
             if not isinstance(value, dict):
                 raise RequestError("request body must be an object")
@@ -7070,6 +7814,17 @@ def handler_for(backend: Gemma4Backend):
                 request_key = self._request_key()
                 path = self.path.rstrip("/")
                 responses_api = path == "/v1/responses"
+                if path == "/v1/session/cancel":
+                    if body:
+                        raise RequestError(
+                            "session cancel body must be an empty object"
+                        )
+                    if request_key is not None:
+                        raise RequestError(
+                            "session cancel does not accept Idempotency-Key"
+                        )
+                    self._send_json(200, backend.cancel_active_request())
+                    return
                 if path in ("/v1/session/reset", "/v1/session/clear"):
                     if body:
                         raise RequestError(
@@ -7431,7 +8186,7 @@ def handler_for(backend: Gemma4Backend):
                             )
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
                         stream_options = body.get("stream_options") or {}
-                        include_usage = stream_options.get("include_usage", True)
+                        include_usage = stream_options.get("include_usage", False)
                         self._finish_chat_stream(
                             completion, completion_id, created,
                             include_usage=include_usage,
@@ -7464,6 +8219,12 @@ def handler_for(backend: Gemma4Backend):
                         self._stream_error(str(exc), responses_api=responses_api)
                 elif not client_disconnected:
                     self._error(400, str(exc), "invalid_request_error")
+            except ToolOutputError as exc:
+                if stream_started:
+                    if not client_disconnected:
+                        self._stream_error(str(exc), responses_api=responses_api)
+                else:
+                    self._error(502, str(exc), "tool_output_error")
             except BackendError as exc:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
                 self._log_request(
@@ -7621,9 +8382,23 @@ def handler_for(backend: Gemma4Backend):
                 self, completion: Completion, completion_id: str, created: int,
                 *, include_usage: bool) -> None:
             result = completion.result
+            payload = _chat_payload(completion, model=backend.config.model_id,
+                                    completion_id=completion_id, created=created)
+            if completion.tool_message is not None:
+                # Publish tool-mode content only after parsing and native COMMIT.
+                message = payload["choices"][0]["message"]
+                if message.get("content"):
+                    self._write_sse(self._chat_chunk(
+                        completion_id, created, {"content": message["content"]},
+                    ))
+                for index, call in enumerate(message.get("tool_calls", [])):
+                    self._write_sse(self._chat_chunk(
+                        completion_id, created,
+                        {"tool_calls": [{"index": index, **call}]},
+                    ))
             done = {
                 **self._chat_chunk(
-                    completion_id, created, {}, result.finish_reason,
+                    completion_id, created, {}, payload["choices"][0]["finish_reason"],
                 ),
             }
             done["x_salt"].update({
@@ -7655,18 +8430,15 @@ def handler_for(backend: Gemma4Backend):
                 "replayed": result.replayed,
                 "elapsed_s": round(completion.elapsed_s, 3),
             })
-            if include_usage:
-                done["usage"] = {
-                    "prompt_tokens": (
-                        completion.kv_cache.loaded_tokens + result.prompt_tokens
-                    ),
-                    "completion_tokens": result.completion_tokens,
-                    "total_tokens": (
-                        completion.kv_cache.loaded_tokens + result.prompt_tokens +
-                        result.completion_tokens
-                    ),
-                }
+            if "session_mode" in payload["x_salt"]:
+                done["x_salt"]["session_mode"] = payload["x_salt"]["session_mode"]
             self._write_sse(done)
+            if include_usage:
+                self._write_sse({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": backend.config.model_id,
+                    "choices": [], "usage": payload["usage"],
+                })
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             self.close_connection = True
@@ -7826,6 +8598,9 @@ def _apply_server_engine_overrides(args) -> None:
             "SALT_TARGET_ROUTE_F": str(route[2]),
             "SALT_TARGET_ROUTE_Q": str(route[3]),
         })
+    warm_x = getattr(args, "gemma_target_warm_x", None)
+    if warm_x is not None:
+        candidate["SALT_TARGET_WARM_X"] = str(warm_x)
     expert_budget = getattr(args, "gemma_expert_budget_gb", None)
     if expert_budget is not None:
         candidate["SALT_EXPERT_BUDGET_GB"] = str(expert_budget)
@@ -7839,6 +8614,7 @@ def _apply_server_engine_overrides(args) -> None:
 
     try:
         validate_gemma_target_route_config(candidate)
+        _target_warmup_config(candidate)
         residency = validate_gemma_residency_config(candidate, require_host=True)
     except ValueError as exc:
         raise RequestError(str(exc)) from exc
@@ -7865,6 +8641,7 @@ def serve_from_args(args) -> int:
     receipt_value = args.gemma_receipt or str(pool) + ".import.json"
     config = Gemma4Config(
         source_dir=Path(args.gemma_source_dir).expanduser(),
+        session_mode=getattr(args, "gemma_session_mode", "stateful"),
         pool=pool,
         receipt=Path(receipt_value).expanduser(),
         model_id=args.model,
@@ -7957,6 +8734,7 @@ def serve_from_args(args) -> int:
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_BEGIN v1
             f"timeout={config.timeout_s:g}s "
             f"copilot-cache={config.copilot_cache_id or 'off'} "
+            f"resident-prefix={backend.mindset_end if backend.copilot_pinned_prefix else 'off'} "
 # SALT_GEMMA4_PHYSICAL_BUILD_ONLY_END v1
             f"one-live-session "
             f"runtime_ready={str(RUNTIME_READY).lower()}",

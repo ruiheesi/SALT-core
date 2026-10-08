@@ -20,12 +20,15 @@ MAX_OUTPUT_TOKENS=${GEMMA4_MAX_OUTPUT_TOKENS:-4096}
 PREFILL_CHUNK_TOKENS=${GEMMA4_PREFILL_CHUNK_TOKENS:-1024}
 TIMEOUT_S=${GEMMA4_TIMEOUT_S:-3600}
 WORKERS=${GEMMA4_WORKERS:-4}
-EXPERT_BUDGET_GB=${GEMMA4_EXPERT_BUDGET_GB:-2}
+EXPERT_BUDGET_GB=${GEMMA4_EXPERT_BUDGET_GB:-4}
 KV_BUDGET_GB=${GEMMA4_KV_BUDGET_GB:-1.25}
-MEMORY_LIMIT_GB=${GEMMA4_MEMORY_LIMIT_GB:-6}
-COPILOT_CACHE_ID=${GEMMA4_COPILOT_CACHE_ID:-copilot-default}
+MEMORY_LIMIT_GB=${GEMMA4_MEMORY_LIMIT_GB:-8}
+COPILOT_CACHE_ID=${GEMMA4_COPILOT_CACHE_ID-copilot-default}
+SESSION_MODE=${GEMMA4_SESSION_MODE:-stateful}
 RECIPE=${SALT_GEMMA_PLATFORM_RECIPE:-mac-metal}
+RECIPE_CONFIG="$ROOT/models/gemma4-26b-a4b/configs/$RECIPE/engine.config"
 BASE_URL="http://$HOST:$PORT"
+CACHE_LABEL=${COPILOT_CACHE_ID:-off}
 
 fail() {
     printf 'salt-start: %s\n' "$*" >&2
@@ -35,23 +38,41 @@ fail() {
 if [[ ${1:-} == "-h" || ${1:-} == "--help" || \
       ${2:-} == "-h" || ${2:-} == "--help" ]]; then
     cat <<EOF
-Usage: st start
-       st restart
+Usage: st start [-x N]
+       st restart [-x N]
+       st cli-start [-x N]
        st logs
 
 Starts the local SALT Gemma server in the background at $BASE_URL.
 The restart command safely replaces this repo's server and native engine.
+The cli-start command selects stateless plain-chat mode without Copilot cache.
+The -x/--target-x option selects X-TARGET rows (1..128).
 The logs command follows the latest server log until interrupted.
 Log: $LOG_FILE
 EOF
     exit 0
 fi
 ACTION=${1:-start}
-[[ $# -le 1 ]] || fail "unexpected arguments: $*"
+shift || true
 [[ "$ACTION" == "start" || "$ACTION" == "restart" || "$ACTION" == "logs" ]] || \
     fail "expected 'start', 'restart', or 'logs', got: $ACTION"
 
+TARGET_X_OVERRIDE=
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -x|--target-x)
+            [[ $# -ge 2 ]] || fail "$1 requires a row count"
+            TARGET_X_OVERRIDE=$2
+            shift 2
+            ;;
+        *)
+            fail "unexpected argument: $1"
+            ;;
+    esac
+done
+
 if [[ "$ACTION" == "logs" ]]; then
+    [[ -z "$TARGET_X_OVERRIDE" ]] || fail "-x is not valid with logs"
     [[ -f "$LOG_FILE" ]] || fail "log does not exist yet: $LOG_FILE"
     exec tail -n "${SALT_TALK_LOG_LINES:-80}" -f "$LOG_FILE"
 fi
@@ -59,10 +80,29 @@ fi
 [[ -x "$PYTHON" ]] || fail "Python is not executable: $PYTHON"
 [[ -f "$ROOT/server/serve.py" ]] || fail "invalid repository root: $ROOT"
 [[ -x "$ROOT/gemma4-server" ]] || fail "missing binary: $ROOT/gemma4-server"
+[[ -f "$RECIPE_CONFIG" ]] || fail "missing recipe config: $RECIPE_CONFIG"
 for artifact in "$SOURCE_DIR/config.json" "$POOL" "$RECEIPT" \
         "$AUTH_RECEIPT" "$BUILD_RECEIPT"; do
     [[ -e "$artifact" ]] || fail "missing required artifact: $artifact"
 done
+
+recipe_value() {
+    local key=$1 value
+    value=$(sed -n "s/^${key}=//p" "$RECIPE_CONFIG" | tail -n 1)
+    [[ -n "$value" ]] || fail "recipe $RECIPE does not define $key"
+    printf '%s' "$value"
+}
+
+TARGET_ROUTE_N=$(recipe_value SALT_TARGET_ROUTE_N)
+TARGET_ROUTE_F=$(recipe_value SALT_TARGET_ROUTE_F)
+TARGET_ROUTE_Q=$(recipe_value SALT_TARGET_ROUTE_Q)
+TARGET_X=${TARGET_X_OVERRIDE:-$(recipe_value SALT_TARGET_X)}
+[[ "$TARGET_X" =~ ^[1-9][0-9]*$ ]] || fail "X must be a canonical positive integer"
+TARGET_WARM_X=$(recipe_value SALT_TARGET_WARM_X)
+if [[ -n "$TARGET_X_OVERRIDE" ]]; then
+    (( TARGET_X <= 128 )) || fail "X must be between 1 and 128"
+    TARGET_WARM_X=$TARGET_X
+fi
 
 listener_pid() {
     command -v lsof >/dev/null 2>&1 || return 1
@@ -70,14 +110,18 @@ listener_pid() {
 }
 
 stop_server() {
-    local pid command_text remaining
+    local pid command_text command_cwd remaining
     pid=$(listener_pid || true)
     [[ -n "$pid" ]] || return 0
     [[ "$pid" != *$'\n'* && "$pid" =~ ^[0-9]+$ ]] || \
         fail "expected one listener PID on port $PORT, got: $pid"
     command_text=$(ps -p "$pid" -o command= 2>/dev/null || true)
-    [[ "$command_text" == *"$ROOT/server/serve.py"* && \
-       "$command_text" == *"--backend gemma4"* ]] || \
+    command_cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | \
+        sed -n 's/^n//p' | head -n 1)
+    [[ "$command_text" == *"--backend gemma4"* && \
+       ( "$command_text" == *"$ROOT/server/serve.py"* || \
+         ( "$command_cwd" == "$ROOT" && \
+           "$command_text" == *"server/serve.py"* ) ) ]] || \
         fail "port $PORT is not owned by this repo's Gemma server"
 
     printf 'salt-start: stopping server and native engine (PID %s)\n' "$pid"
@@ -97,10 +141,13 @@ stop_server() {
 if [[ "$ACTION" == "restart" ]]; then
     stop_server
 elif curl --fail --silent --max-time 2 "$BASE_URL/healthz" >/dev/null 2>&1; then
-    printf 'salt-start: already ready at %s (arena %sGB, KV %sGB, CTX%s/O%s, B%s, timeout %ss, cache %s)\n' \
-        "$BASE_URL" "$EXPERT_BUDGET_GB" "$KV_BUDGET_GB" \
-        "$CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_CHUNK_TOKENS" \
-        "$TIMEOUT_S" "$COPILOT_CACHE_ID"
+    if [[ -n "$TARGET_X_OVERRIDE" ]]; then
+        fail "server is already running; use 'st restart -x $TARGET_X' to change X"
+    fi
+    printf 'salt-start: already ready at %s (mode %s, expert %sGB, memory-limit %sGB, KV %sGB, CTX%s/O%s, B%s, X%s, timeout %ss, cache %s)\n' \
+        "$BASE_URL" "$SESSION_MODE" "$EXPERT_BUDGET_GB" "$MEMORY_LIMIT_GB" "$KV_BUDGET_GB" \
+        "$CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_CHUNK_TOKENS" "$TARGET_X" \
+        "$TIMEOUT_S" "$CACHE_LABEL"
     exit 0
 fi
 
@@ -112,30 +159,43 @@ fi
 mkdir -p "$RUN_DIR"
 cd "$ROOT"
 
-nohup env -u PYTHONPATH \
-    SALT_GEMMA_PLATFORM_RECIPE="$RECIPE" \
-    PYTHONUNBUFFERED=1 \
-    "$PYTHON" "$ROOT/server/serve.py" \
-    --backend gemma4 \
-    --host "$HOST" \
-    --port "$PORT" \
-    --model "$MODEL" \
-    --gemma-source-dir "$SOURCE_DIR" \
-    --gemma-pool "$POOL" \
-    --gemma-receipt "$RECEIPT" \
-    --gemma-auth-receipt "$AUTH_RECEIPT" \
-    --gemma-server-build-receipt "$BUILD_RECEIPT" \
-    --gemma-workers "$WORKERS" \
-    --gemma-expert-budget-gb "$EXPERT_BUDGET_GB" \
-    --gemma-memory-limit-gb "$MEMORY_LIMIT_GB" \
-    --gemma-context-tokens "$CONTEXT_TOKENS" \
-    --gemma-max-output-tokens "$MAX_OUTPUT_TOKENS" \
-    --gemma-prefill-chunk-tokens "$PREFILL_CHUNK_TOKENS" \
-    --gemma-timeout-s "$TIMEOUT_S" \
-    --gemma-kv-budget-gb "$KV_BUDGET_GB" \
-    --gemma-copilot-cache-id "$COPILOT_CACHE_ID" \
-    > >("$PYTHON" "$ROOT/tools/salt-logstamp.py" >>"$LOG_FILE") \
-    2>&1 </dev/null &
+server_command=(
+    env -u PYTHONPATH -u GEMMA4_COPILOT_CACHE_ID
+    SALT_GEMMA_PLATFORM_RECIPE="$RECIPE"
+    PYTHONUNBUFFERED=1
+    "$PYTHON" "$ROOT/server/serve.py"
+    --backend gemma4
+    --host "$HOST"
+    --port "$PORT"
+    --model "$MODEL"
+    --gemma-session-mode "$SESSION_MODE"
+    --gemma-source-dir "$SOURCE_DIR"
+    --gemma-pool "$POOL"
+    --gemma-receipt "$RECEIPT"
+    --gemma-auth-receipt "$AUTH_RECEIPT"
+    --gemma-server-build-receipt "$BUILD_RECEIPT"
+    --gemma-workers "$WORKERS"
+    --gemma-expert-budget-gb "$EXPERT_BUDGET_GB"
+    --gemma-memory-limit-gb "$MEMORY_LIMIT_GB"
+    --gemma-context-tokens "$CONTEXT_TOKENS"
+    --gemma-max-output-tokens "$MAX_OUTPUT_TOKENS"
+    --gemma-prefill-chunk-tokens "$PREFILL_CHUNK_TOKENS"
+    --gemma-target-route-n "$TARGET_ROUTE_N"
+    --gemma-target-x "$TARGET_X"
+    --gemma-target-warm-x "$TARGET_WARM_X"
+    --gemma-target-route-f "$TARGET_ROUTE_F"
+    --gemma-target-route-q "$TARGET_ROUTE_Q"
+    --gemma-timeout-s "$TIMEOUT_S"
+    --gemma-kv-budget-gb "$KV_BUDGET_GB"
+)
+if [[ -n "$COPILOT_CACHE_ID" ]]; then
+    server_command+=(--gemma-copilot-cache-id "$COPILOT_CACHE_ID")
+fi
+
+nohup "$PYTHON" "$ROOT/tools/salt-logstamp.py" \
+    --output "$LOG_FILE" -- \
+    "${server_command[@]}" \
+    >/dev/null 2>&1 </dev/null &
 server_pid=$!
 printf '%s\n' "$server_pid" >"$PID_FILE"
 
@@ -146,10 +206,10 @@ for ((attempt = 0; attempt < 120; attempt++)); do
         exit 1
     fi
     if curl --fail --silent --max-time 2 "$BASE_URL/healthz" >/dev/null 2>&1; then
-        printf 'salt-start: ready at %s (PID %s, arena %sGB, KV %sGB, CTX%s/O%s, B%s, timeout %ss, cache %s)\n' \
-            "$BASE_URL" "$server_pid" "$EXPERT_BUDGET_GB" "$KV_BUDGET_GB" \
-            "$CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_CHUNK_TOKENS" \
-            "$TIMEOUT_S" "$COPILOT_CACHE_ID"
+        printf 'salt-start: ready at %s (PID %s, mode %s, expert %sGB, memory-limit %sGB, KV %sGB, CTX%s/O%s, B%s, X%s, timeout %ss, cache %s)\n' \
+            "$BASE_URL" "$server_pid" "$SESSION_MODE" "$EXPERT_BUDGET_GB" "$MEMORY_LIMIT_GB" "$KV_BUDGET_GB" \
+            "$CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_CHUNK_TOKENS" "$TARGET_X" \
+            "$TIMEOUT_S" "$CACHE_LABEL"
         printf 'salt-start: log %s\n' "$LOG_FILE"
         exit 0
     fi

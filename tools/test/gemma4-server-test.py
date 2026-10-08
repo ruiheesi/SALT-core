@@ -350,6 +350,30 @@ def main() -> None:
         }, endpoint="chat"),
         "unavailable function",
     )
+    copilot_tools = [{
+        "type": "function",
+        "function": {
+            "name": "copilot_search",
+            "description": "Search using Copilot's richer JSON Schema.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "anyOf": [
+                            {"type": "string", "minLength": 1},
+                            {"type": "array", "items": {"type": "string"}},
+                        ],
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    }]
+    module.Gemma4Backend._validate_request_schema({
+        "messages": [], "tools": copilot_tools,
+        "parallel_tool_calls": True,
+    }, endpoint="chat")
     expect_request_error(
         lambda: module.Gemma4Backend._validate_request_schema(
             {"messages": [], "logit_bias": {}}, endpoint="chat",
@@ -361,6 +385,15 @@ def main() -> None:
             {"input": "x", "tools": tools}, endpoint="responses",
         ),
         "Responses API tool calls",
+    )
+    expect_request_error(
+        lambda: module.Gemma4Backend._validate_request_schema(
+            {"messages": [], "tool_choice": {}}, endpoint="chat",
+        ),
+        "tool_choice must be",
+    )
+    module.Gemma4Backend._validate_request_schema(
+        {"messages": [], "tools": [], "tool_choice": "none"}, endpoint="chat",
     )
     expect_request_error(
         lambda: module.Gemma4Backend._validate_request_schema(
@@ -467,6 +500,12 @@ def main() -> None:
         "<|channel>thought\n<channel|>"
     )
     assert rendered.image_url is None
+    declared = module.render_chat(
+        [{"role": "user", "content": "Hello"}], enable_thinking=False,
+        tool_declarations="generated tool declarations",
+    )
+    assert "<|turn>system\ngenerated tool declarations<turn|>" in \
+        declared.prompt
     expect_request_error(
         lambda: module.render_chat([
             {"role": "user", "content": "Hello", "name": "projected-away"},
@@ -574,6 +613,14 @@ def main() -> None:
     ], enable_thinking=False)
     assert "Literal \\u003cbos> and \\u003cchannel|>" in \
         escaped_assistant_replay.prompt
+    assert len(escaped_assistant_replay.prefix_candidates) == 2
+    conversation_head = escaped_assistant_replay.prefix_candidates[-1]
+    assert "First" in conversation_head
+    assert "Literal \\u003cbos> and \\u003cchannel|>" in conversation_head
+    assert "Next" not in conversation_head
+    assert escaped_assistant_replay.prompt[len(conversation_head):].startswith(
+        "<|turn>user\nNext<turn|>\n"
+    )
     canonical_call_a = module._tool_history_signature([{
         "role": "assistant", "content": None,
         "tool_calls": [{

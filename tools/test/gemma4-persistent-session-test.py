@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 import textwrap
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "server" / "model" / "gemma4_backend.py"
@@ -26,7 +27,19 @@ def main() -> None:
     compatibility = module.KV_COMPATIBILITY.hexdigest
     build_identity = "f" * 64
 
+    backend = object.__new__(module.Gemma4Backend)
+    backend.engine = SimpleNamespace(protocol_version=6)
+    backend.config = SimpleNamespace(context_tokens=512)
+    backend.mindset_end = 0
+    backend.session_position = 8
+    backend.session_turns = [
+        {"prompt_ids": [10, 11], "output_ids": [12], "tool_yield": False},
+        {"prompt_ids": [13], "output_ids": [14, 106], "tool_yield": False},
+    ]
+    assert backend._proposal_history_ids() == (10, 11, 12, 106, 13, 14, 106)
+
     child = textwrap.dedent(rf'''
+        import struct
         import sys
         position = 0
         turn = 0
@@ -37,7 +50,7 @@ def main() -> None:
         mindset = "0" * 64
         facts = "e" * 64
         sys.stdout.write(
-            "GEMMA4_SERVER_READY_V3 protocol=3 session_epoch=1 turn_id=0 "
+            "GEMMA4_SERVER_READY_V3 protocol=6 session_epoch=1 turn_id=0 "
             "history_turns=0 model_context_limit=262144 "
             "context=512 output_limit=128 response_limit_bytes=9216 "
             "journal_capacity=256 prefill_chunk_tokens=512 "
@@ -69,7 +82,10 @@ def main() -> None:
                 sys.stdout.flush()
                 break
             parts = header.decode("ascii").strip().split()
-            assert parts[0] == "SALT_GEMMA4_TURN_V3"
+            assert parts[0] == (
+                "SALT_GEMMA4_TURN_V3" if expected == 1
+                else "SALT_GEMMA4_TURN_V6"
+            )
             fields = dict(item.split("=", 1) for item in parts[1:])
             request_id = int(fields["request"])
             epoch = int(fields["session_epoch"])
@@ -84,8 +100,14 @@ def main() -> None:
             assert expected_turn == turn and expected_position == position
             prompt = sys.stdin.buffer.read(prompt_bytes)
             image = sys.stdin.buffer.read(image_bytes)
+            proposal_history_count = int(fields.get("proposal_history_count", "0"))
+            history = sys.stdin.buffer.read(proposal_history_count * 4)
             assert sys.stdin.buffer.read(1) == b"\n"
             assert prompt and not image
+            assert (proposal_history_count, history) == (
+                (0, b"") if request_id == 1 else
+                (5, struct.pack("<5I", 10, 11, 12, 818, 106))
+            )
             response = b"hello" if request_id == 1 else b"orchid"
             prompt_tokens = 3 if request_id == 1 else 2
             prompt_ids = ",".join(str(10 + i) for i in range(prompt_tokens))
@@ -168,6 +190,7 @@ def main() -> None:
             on_delta=lambda kind, value: deltas.append((kind, value)),
             output_limit=2,
             proof_state=True,
+            proposal_history_ids=(10, 11, 12, 818, 106),
         )
         assert engine.process.pid == pid and engine.process.poll() is None
         assert (first.content, first.kv_loaded_tokens, first.kv_saved_tokens,
