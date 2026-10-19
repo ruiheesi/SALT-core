@@ -44,7 +44,7 @@ TEXT_SUFFIXES = {
 def dispatch_command() -> None:
     """Handle utility subcommands before parsing a chat prompt."""
     if len(sys.argv) < 2 or sys.argv[1] not in {
-            "start", "restart", "logs", "cli-start"}:
+            "start", "restart", "down", "logs", "cli-start"}:
         return
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "salt-start.sh")
     if sys.argv[1] == "cli-start":
@@ -61,7 +61,8 @@ def arguments() -> argparse.Namespace:
             "commands: st 'question'; st session; st summary FILE...; "
             "st find 'query' [PATH...]; st vision IMAGE [QUESTION]; "
             "st -a reader 'question'; st -mo 1024 'question'; "
-            "st --new-session 'question'; st agents; st cli-start"
+            "st --new-session 'question'; st agents; st start; st down; "
+            "st cli-start"
         ),
     )
     parser.add_argument("prompt", nargs="*", help="prompt text; reads interactively if omitted")

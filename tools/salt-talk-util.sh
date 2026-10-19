@@ -12,6 +12,7 @@ salt_start() {
 # Short forms:
 #   st start [-x N]
 #   st restart [-x N]
+#   st down
 #   st cli-start [-x N]
 #   st logs
 #   st "your prompt"
@@ -34,7 +35,8 @@ salt_start() {
 #   st vision screenshot.png "what is wrong here?"
 st() {
     if [[ ${1:-} == "start" || ${1:-} == "restart" || \
-          ${1:-} == "cli-start" || ${1:-} == "logs" ]]; then
+          ${1:-} == "down" || ${1:-} == "cli-start" || \
+          ${1:-} == "logs" ]]; then
         salt_start "$@"
         return
     fi

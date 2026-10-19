@@ -40,11 +40,13 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" || \
     cat <<EOF
 Usage: st start [-x N]
        st restart [-x N]
+       st down
        st cli-start [-x N]
        st logs
 
 Starts the local SALT Gemma server in the background at $BASE_URL.
 The restart command safely replaces this repo's server and native engine.
+The down command safely stops this repo's server and native engine.
 The cli-start command selects stateless plain-chat mode without Copilot cache.
 The -x/--target-x option selects X-TARGET rows (1..128).
 The logs command follows the latest server log until interrupted.
@@ -54,8 +56,9 @@ EOF
 fi
 ACTION=${1:-start}
 shift || true
-[[ "$ACTION" == "start" || "$ACTION" == "restart" || "$ACTION" == "logs" ]] || \
-    fail "expected 'start', 'restart', or 'logs', got: $ACTION"
+[[ "$ACTION" == "start" || "$ACTION" == "restart" || \
+   "$ACTION" == "down" || "$ACTION" == "logs" ]] || \
+    fail "expected 'start', 'restart', 'down', or 'logs', got: $ACTION"
 
 TARGET_X_OVERRIDE=
 while [[ $# -gt 0 ]]; do
@@ -112,7 +115,7 @@ listener_pid() {
 stop_server() {
     local pid command_text command_cwd remaining
     pid=$(listener_pid || true)
-    [[ -n "$pid" ]] || return 0
+    [[ -n "$pid" ]] || return 1
     [[ "$pid" != *$'\n'* && "$pid" =~ ^[0-9]+$ ]] || \
         fail "expected one listener PID on port $PORT, got: $pid"
     command_text=$(ps -p "$pid" -o command= 2>/dev/null || true)
@@ -127,19 +130,35 @@ stop_server() {
     printf 'salt-start: stopping server and native engine (PID %s)\n' "$pid"
     kill -INT "$pid"
     for ((remaining = 0; remaining < 40; remaining++)); do
-        [[ -z "$(listener_pid || true)" ]] && return 0
+        if [[ -z "$(listener_pid || true)" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
         sleep 0.25
     done
     kill -TERM "$pid" 2>/dev/null || true
     for ((remaining = 0; remaining < 20; remaining++)); do
-        [[ -z "$(listener_pid || true)" ]] && return 0
+        if [[ -z "$(listener_pid || true)" ]] && ! kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
         sleep 0.25
     done
     fail "server PID $pid did not release port $PORT"
 }
 
+if [[ "$ACTION" == "down" ]]; then
+    [[ -z "$TARGET_X_OVERRIDE" ]] || fail "-x is not valid with down"
+    if stop_server; then
+        rm -f "$PID_FILE"
+        printf 'salt-start: stopped server and native engine\n'
+    else
+        rm -f "$PID_FILE"
+        printf 'salt-start: already stopped\n'
+    fi
+    exit 0
+fi
+
 if [[ "$ACTION" == "restart" ]]; then
-    stop_server
+    stop_server || true
 elif curl --fail --silent --max-time 2 "$BASE_URL/healthz" >/dev/null 2>&1; then
     if [[ -n "$TARGET_X_OVERRIDE" ]]; then
         fail "server is already running; use 'st restart -x $TARGET_X' to change X"
