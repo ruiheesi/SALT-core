@@ -59,12 +59,20 @@ def build_parser():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--backend", choices=("qwen", "gemma4", "maple"), default="qwen",
+    p.add_argument("--backend", choices=("qwen", "gemma4", "maple", "lfm"), default="qwen",
                    help="model execution backend (default: qwen)")
     p.add_argument("--maple-package", default=None)
     p.add_argument("--maple-runner", default=None)
     p.add_argument("--maple-context", type=int, default=None)
     p.add_argument("--maple-batch", type=int, default=None)
+    p.add_argument("--lfm-package", default=None)
+    p.add_argument("--lfm-runner", default=None)
+    p.add_argument("--lfm-context", type=int, default=None)
+    p.add_argument("--lfm-batch", type=int, default=None)
+    p.add_argument("--lfm-workers", type=int, default=None)
+    p.add_argument("--lfm-expert-slots", type=int, default=None)
+    p.add_argument("--lfm-memory-limit-gb", type=float, default=None)
+    p.add_argument("--lfm-timeout-s", type=float, default=None)
     p.add_argument("--salt", default=CFG.get("SALT_BIN", "./salt"),
                    help="engine binary (default ./salt)")
     p.add_argument("--model", default=None,
@@ -1224,6 +1232,14 @@ def main():
             return serve_from_args(ARGS)
         except (ValueError, RuntimeError, OSError) as exc:
             print(f"[maple-serve] setup failed: {exc}", file=sys.stderr, flush=True)
+            return 2
+    if ARGS.backend == "lfm":
+        from lfm_backend import serve_from_args
+        try:
+            return serve_from_args(ARGS)
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"[liquid-serve] setup failed: {exc}",
+                  file=sys.stderr, flush=True)
             return 2
     if ARGS.model is None:
         ARGS.model = ("gemma-4-26b-a4b-it"

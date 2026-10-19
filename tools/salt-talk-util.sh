@@ -15,6 +15,7 @@ salt_start() {
 #   st down
 #   st cli-start [-x N]
 #   st logs
+#   st config [gemma|liquid]
 #   st "your prompt"
 #   st session
 #   st session -a reader -mo 512
@@ -36,7 +37,7 @@ salt_start() {
 st() {
     if [[ ${1:-} == "start" || ${1:-} == "restart" || \
           ${1:-} == "down" || ${1:-} == "cli-start" || \
-          ${1:-} == "logs" ]]; then
+          ${1:-} == "logs" || ${1:-} == "config" ]]; then
         salt_start "$@"
         return
     fi

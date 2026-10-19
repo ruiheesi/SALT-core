@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small streaming chat client for the local SALT Gemma server."""
+"""Small streaming chat client for the configured local SALT model."""
 
 from __future__ import annotations
 
@@ -23,9 +23,44 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:8090/v1/chat/completions"
-DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 DEFAULT_AGENT_DIR = Path(__file__).resolve().with_name("salt-agents")
-DEFAULT_RUN_DIR = Path(__file__).resolve().parents[1] / "build" / "run"
+DEFAULT_RUN_DIR = Path(os.environ.get(
+    "SALT_TALK_RUN_DIR",
+    Path(__file__).resolve().parents[1] / "build" / "run",
+))
+MODEL_IDS = {
+    "gemma": "gemma-4-26b-a4b-it",
+    "liquid": "lfm2.5-24b-a2b",
+}
+
+
+def configured_profile() -> str:
+    value = os.environ.get("SALT_TALK_PROFILE", "").strip()
+    if not value:
+        config = Path(os.environ.get(
+            "SALT_TALK_CONFIG_FILE", DEFAULT_RUN_DIR / "salt-talk-model",
+        ))
+        try:
+            value = config.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            value = "gemma"
+        except OSError as exc:
+            raise SystemExit(f"salt-talk: cannot read model config {config}: {exc}")
+    aliases = {
+        "gemma": "gemma", "gemma4": "gemma",
+        "gemma-4-26b-a4b-it": "gemma",
+        "liquid": "liquid", "lfm": "liquid", "lfm2": "liquid",
+        "lfm2.5-24b-a2b": "liquid",
+    }
+    try:
+        return aliases[value]
+    except KeyError as exc:
+        raise SystemExit(
+            f"salt-talk: invalid configured model {value!r}; "
+            "run `st config gemma` or `st config liquid`"
+        ) from exc
+
+
 DEFAULT_SESSION_ID = "salt-talk-default"
 SESSION_STATE_SCHEMA = "salt.talk.session.v1"
 MAX_SESSION_STATE_BYTES = 4 * 1024 * 1024
@@ -44,10 +79,10 @@ TEXT_SUFFIXES = {
 def dispatch_command() -> None:
     """Handle utility subcommands before parsing a chat prompt."""
     if len(sys.argv) < 2 or sys.argv[1] not in {
-            "start", "restart", "down", "logs", "cli-start"}:
+            "start", "restart", "down", "logs", "config", "cli-start"}:
         return
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "salt-start.sh")
-    if sys.argv[1] == "cli-start":
+    if sys.argv[1] == "cli-start" and configured_profile() == "gemma":
         os.environ["GEMMA4_SESSION_MODE"] = "openai"
         os.environ["GEMMA4_COPILOT_CACHE_ID"] = ""
         os.execv(script, [script, "restart", *sys.argv[2:]])
@@ -56,13 +91,13 @@ def dispatch_command() -> None:
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream a response from the local SALT Gemma server.",
+        description="Stream a response from the configured local SALT model.",
         epilog=(
             "commands: st 'question'; st session; st summary FILE...; "
             "st find 'query' [PATH...]; st vision IMAGE [QUESTION]; "
             "st -a reader 'question'; st -mo 1024 'question'; "
             "st --new-session 'question'; st agents; st start; st down; "
-            "st cli-start"
+            "st cli-start; st config [gemma|liquid]"
         ),
     )
     parser.add_argument("prompt", nargs="*", help="prompt text; reads interactively if omitted")
@@ -70,7 +105,12 @@ def arguments() -> argparse.Namespace:
                         help="named system prompt from tools/salt-agents")
     parser.add_argument("--system", help="literal system prompt (cannot be combined with -a)")
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--model",
+        default=os.environ.get(
+            "SALT_TALK_MODEL", MODEL_IDS[configured_profile()],
+        ),
+    )
     parser.add_argument("-mo", "--max-tokens", type=int, default=256)
     parser.add_argument(
         "-n", "--new-session", action="store_true",
@@ -631,8 +671,12 @@ def prepare_session(
     if compatible:
         turns = int(saved["history_turns"])
         if not quiet:
+            saved_kind = (
+                "conversation history"
+                if status.get("session_mode") == "replay" else "KV"
+            )
             print(
-                f"salt-talk: reloading saved KV ({turns} prior "
+                f"salt-talk: reloading saved {saved_kind} ({turns} prior "
                 f"{'turn' if turns == 1 else 'turns'})...",
                 file=sys.stderr, flush=True,
             )
@@ -645,7 +689,10 @@ def prepare_session(
                 imported.get("history_turns") != saved["history_turns"] or
                 imported.get("state_sha256") != saved["state_sha256"]):
             raise ValueError("imported session does not match saved KV identity")
-        return "resumed from saved KV", turns
+        resumed_kind = (
+            "history" if status.get("session_mode") == "replay" else "saved KV"
+        )
+        return f"resumed from {resumed_kind}", turns
     return "new", 0
 
 

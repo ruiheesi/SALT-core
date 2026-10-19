@@ -44,3 +44,25 @@ state/KV parity was qualified from this exported tree.
 
 The public build, supported-platform, security, contribution, and release
 documents are still review gates. Do not publish this dry-run tree.
+
+## Local `st` model selection
+
+`st` and `st start` share a persisted model profile:
+
+```bash
+st config                 # show the selected model and local readiness
+st config gemma           # select Gemma 4 26B-A4B
+st config liquid          # select Liquid LFM2.5-24B-A2B
+st restart                # replace the running backend with that model
+```
+
+The Liquid profile expects the authenticated package described in
+`models/lfm2-24b-a2b/README.md` and a Metal runner built with:
+
+```bash
+LFM_BACKEND=metal LFM_BIN_DIR="$PWD/build/bin" make lfm-server
+```
+
+The exported Liquid native entry is currently one-shot. Its `st` adapter saves
+and replays bounded conversation text (`kv_reuse=false`); it does not claim
+persistent cross-request KV reuse.
