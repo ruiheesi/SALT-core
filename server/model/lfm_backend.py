@@ -342,6 +342,12 @@ class Engine:
         encoded = prompt.encode("utf-8")
         if not encoded or len(encoded) > MAX_PROMPT_BYTES:
             raise ValueError("prompt exceeds the Liquid native input bound")
+        # Native readers inherit these open file descriptions.  Operations
+        # such as fdopen(dup(index_fd)) share and advance the parent's offset,
+        # so every one-shot request must restore all package descriptors before
+        # spawning the next process.  Engine.complete serializes this method.
+        for fd in self.fds.values():
+            os.lseek(fd, 0, os.SEEK_SET)
         with tempfile.TemporaryFile(prefix="salt-lfm-prompt-") as prompt_file:
             prompt_file.write(encoded)
             prompt_file.flush()

@@ -91,7 +91,7 @@
       "snapshot_path": "models/gemma4-26b-a4b/compat/v6/server/serve.py",
       "snapshot_sha256": "2cafc3835c8a9f8f1006223262751ea00b79a981d66a88350ebc1e70508b7c8e",
       "live_projection": "pin-live-source-v1",
-      "live_sha256": "ea0d944039a5601accab47ff11593db9d8c41230f1c2efb1421d738c3fe22b7f"
+      "live_sha256": "dac9ffea2bfff476250ac27bc5660bb0a214935080855c46dc735a5061e56b67"
     },
     {
       "logical_path": "src/attn_batch.c",
