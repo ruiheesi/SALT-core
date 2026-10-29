@@ -10,8 +10,9 @@ salt_start() {
 }
 
 # Short forms:
-#   st start [-x N]
-#   st restart [-x N]
+#   st start [-x N]       # Gemma uses the isolated layer-rotation runtime
+#   st restart [-x N]     # N must match rotation/engine.config native_target_x
+#   st setup              # rehash Gemma and establish this machine/path baseline
 #   st down
 #   st cli-start [-x N]
 #   st logs
@@ -36,6 +37,7 @@ salt_start() {
 #   st vision screenshot.png "what is wrong here?"
 st() {
     if [[ ${1:-} == "start" || ${1:-} == "restart" || \
+          ${1:-} == "setup" || \
           ${1:-} == "down" || ${1:-} == "cli-start" || \
           ${1:-} == "logs" || ${1:-} == "config" ]]; then
         salt_start "$@"

@@ -3488,8 +3488,11 @@ static int schedule_normal(SaltTextTokenEpochController *controller,
         return schedule_native(controller, q, r);
     /* Parent cache route views: committed prompt/session tokens, then the
      * outputs this run has already committed. Borrowed, never copied. */
-    controller->schedule_history_ids = q->history_ids;
-    controller->schedule_history_count = q->history_ids ? q->history_count : 0u;
+    controller->schedule_history_ids = q->proposal_history_ids
+        ? q->proposal_history_ids : q->history_ids;
+    controller->schedule_history_count = q->proposal_history_ids
+        ? q->proposal_history_count
+        : (q->history_ids ? q->history_count : 0u);
     controller->schedule_output_ids = q->output_ids;
     controller->schedule_output_count = r->output_count;
     effective_x = 1u;
@@ -4056,7 +4059,10 @@ int salt_text_scheduler_run(SaltTextTokenEpochController *controller,
     memset(r, 0, sizeof *r);
     r->source_position = schedule_position(b);
     if ((q->history_ids == NULL && q->history_count != 0u) ||
+        (q->proposal_history_ids == NULL &&
+         q->proposal_history_count != 0u) ||
         q->history_count > r->source_position ||
+        q->proposal_history_count > r->source_position ||
         q->prior_kv_rows > r->source_position)
         goto fail;
     controller->schedule_prior_kv_rows = q->prior_kv_rows;

@@ -79,7 +79,8 @@ TEXT_SUFFIXES = {
 def dispatch_command() -> None:
     """Handle utility subcommands before parsing a chat prompt."""
     if len(sys.argv) < 2 or sys.argv[1] not in {
-            "start", "restart", "down", "logs", "config", "cli-start"}:
+            "start", "restart", "setup", "down", "logs", "config",
+            "cli-start"}:
         return
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "salt-start.sh")
     if sys.argv[1] == "cli-start" and configured_profile() == "gemma":
@@ -97,7 +98,7 @@ def arguments() -> argparse.Namespace:
             "st find 'query' [PATH...]; st vision IMAGE [QUESTION]; "
             "st -a reader 'question'; st -mo 1024 'question'; "
             "st --new-session 'question'; st agents; st start; st down; "
-            "st cli-start; st config [gemma|liquid]"
+            "st setup; st cli-start; st config [gemma|liquid]"
         ),
     )
     parser.add_argument("prompt", nargs="*", help="prompt text; reads interactively if omitted")

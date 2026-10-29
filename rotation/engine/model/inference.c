@@ -1041,6 +1041,7 @@ static int parse_turn_header(
         char request_sha256[G4_SHA256_HEX + 1],
         size_t *prompt_bytes,
         size_t *image_path_bytes,
+        size_t *proposal_history_count,
         int *output_limit,
         int *proof_state,
         uint32_t *sampler_abi,
@@ -1050,6 +1051,7 @@ static int parse_turn_header(
         uint32_t *logit_top_k,
         int *tool_mode, int *input_mode) {
     unsigned long long raw_position, raw_prompt, raw_image;
+    unsigned long long raw_proposal_history = 0;
     unsigned long long raw_output, raw_proof, raw_seed;
     unsigned long long raw_tool_mode = 0;
     unsigned long long raw_input_mode = 0;
@@ -1062,13 +1064,45 @@ static int parse_turn_header(
     if (!line || !request_id || !session_epoch || !turn_id ||
         !history_turns || !position || !client_request_sha256 ||
         !request_sha256 || !prompt_bytes || !image_path_bytes ||
+        !proposal_history_count ||
         !output_limit || !proof_state || !sampler_abi ||
         !temperature_bits || !sampler_seed || !sampler_top_k || !logit_top_k ||
         !tool_mode || !input_mode)
         return SALT_TFAIL(-1);
     if (!strncmp(line, "SALT_GEMMA4_TURN_V6 ",
                  sizeof "SALT_GEMMA4_TURN_V6 " - 1u)) {
-        if (sscanf(line,
+        if (strstr(line, " proposal_history_count=") != NULL) {
+            if (sscanf(line,
+                "SALT_GEMMA4_TURN_V6 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "proposal_history_count=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%8x seed=%llu top_k=%u "
+                "tool_mode=%llu input_mode=%llu "
+                "client_request_sha256=%64s request_sha256=%64s %c",
+                request_id, session_epoch, turn_id, history_turns,
+                &raw_position, &raw_prompt, &raw_image,
+                &raw_proposal_history, &raw_output, &raw_proof,
+                &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
+                &raw_tool_mode, &raw_input_mode, client_request_sha256,
+                request_sha256, &extra) != 18)
+                return SALT_TFAIL(-1);
+            n = snprintf(canonical, sizeof canonical,
+                "SALT_GEMMA4_TURN_V6 request=%llu session_epoch=%llu "
+                "turn_id=%llu history_turns=%llu position=%llu "
+                "prompt_bytes=%llu image_path_bytes=%llu "
+                "proposal_history_count=%llu "
+                "output_limit=%llu proof_state=%llu sampler_abi=%u "
+                "temperature_bits=%08x seed=%llu top_k=%u "
+                "tool_mode=%llu input_mode=%llu "
+                "client_request_sha256=%s request_sha256=%s\n",
+                *request_id, *session_epoch, *turn_id, *history_turns,
+                raw_position, raw_prompt, raw_image, raw_proposal_history,
+                raw_output, raw_proof, raw_sampler, raw_temperature,
+                raw_seed, raw_top_k, raw_tool_mode, raw_input_mode,
+                client_request_sha256, request_sha256);
+        } else if (sscanf(line,
                 "SALT_GEMMA4_TURN_V6 request=%llu session_epoch=%llu "
                 "turn_id=%llu history_turns=%llu position=%llu "
                 "prompt_bytes=%llu image_path_bytes=%llu "
@@ -1080,9 +1114,10 @@ static int parse_turn_header(
                 &raw_position, &raw_prompt, &raw_image, &raw_output, &raw_proof,
                 &raw_sampler, &raw_temperature, &raw_seed, &raw_top_k,
                 &raw_tool_mode, &raw_input_mode, &raw_logit_top_k,
-                client_request_sha256, request_sha256, &extra) != 18)
+                client_request_sha256, request_sha256, &extra) != 18) {
             return SALT_TFAIL(-1);
-        n = snprintf(canonical, sizeof canonical,
+        } else {
+            n = snprintf(canonical, sizeof canonical,
                 "SALT_GEMMA4_TURN_V6 request=%llu session_epoch=%llu "
                 "turn_id=%llu history_turns=%llu position=%llu "
                 "prompt_bytes=%llu image_path_bytes=%llu "
@@ -1095,6 +1130,7 @@ static int parse_turn_header(
                 raw_sampler, raw_temperature, raw_seed, raw_top_k,
                 raw_tool_mode, raw_input_mode, raw_logit_top_k,
                 client_request_sha256, request_sha256);
+        }
     } else if (!strncmp(line, "SALT_GEMMA4_TURN_V5 ",
                  sizeof "SALT_GEMMA4_TURN_V5 " - 1u)) {
         if (sscanf(line,
@@ -1208,6 +1244,7 @@ static int parse_turn_header(
     if (n < 0 || (size_t)n >= sizeof canonical || strcmp(line, canonical) ||
         raw_position > INT_MAX || raw_prompt > G4_MAX_PROMPT_BYTES ||
         raw_image > G4_MAX_IMAGE_PATH || raw_output < 1 ||
+        raw_proposal_history > (unsigned long long)g_context ||
         raw_output > (unsigned long long)g_output_limit || raw_proof > 1 ||
         raw_tool_mode > 1 || raw_input_mode > 1 ||
         raw_logit_top_k > G4_LOGIT_TOP_K_MAX ||
@@ -1223,6 +1260,7 @@ static int parse_turn_header(
     *position = (int)raw_position;
     *prompt_bytes = (size_t)raw_prompt;
     *image_path_bytes = (size_t)raw_image;
+    *proposal_history_count = (size_t)raw_proposal_history;
     *output_limit = (int)raw_output;
     *proof_state = (int)raw_proof;
     *sampler_abi = (uint32_t)raw_sampler;
@@ -1969,7 +2007,9 @@ static int serve_loop(SaltGemma4Text *text_model,
     G4SchedulerAdapter scheduler = {0};
     char header[640];
     char *prompt = NULL, *image_path = NULL;
-    int *prompt_ids = NULL, *output_ids = NULL, *positions = NULL;
+    int *prompt_ids = NULL, *proposal_history_ids = NULL;
+    int *output_ids = NULL, *positions = NULL;
+    unsigned char *proposal_history_wire = NULL;
     G4TokenLogits *token_logits = NULL;
     unsigned char *mm_types = NULL, *padding = NULL;
     unsigned char mindset_sha256[32];
@@ -2025,6 +2065,10 @@ static int serve_loop(SaltGemma4Text *text_model,
     prompt = (char *)malloc(G4_MAX_PROMPT_BYTES + 1u);
     image_path = (char *)malloc(G4_MAX_IMAGE_PATH + 1u);
     prompt_ids = (int *)malloc((size_t)g_context * sizeof *prompt_ids);
+    proposal_history_ids = (int *)malloc(
+        (size_t)g_context * sizeof *proposal_history_ids);
+    proposal_history_wire = (unsigned char *)malloc(
+        (size_t)g_context * sizeof(uint32_t));
     output_ids = (int *)malloc((size_t)g_output_limit * sizeof *output_ids);
     token_logits = (G4TokenLogits *)calloc(
         (size_t)g_output_limit, sizeof *token_logits);
@@ -2056,7 +2100,8 @@ static int serve_loop(SaltGemma4Text *text_model,
     g_journal_arena.output_used = 0;
     g_journal_arena.response_used = 0;
     g_journal_arena.logits_used = 0;
-    if (!prompt || !image_path || !prompt_ids || !output_ids || !mm_types ||
+    if (!prompt || !image_path || !prompt_ids || !proposal_history_ids ||
+        !proposal_history_wire || !output_ids || !mm_types ||
         !token_logits || !logits || !proposal_logits || !response || !journal ||
         !g_journal_arena.prompt_ids ||
         !g_journal_arena.output_ids || !g_journal_arena.responses ||
@@ -2327,6 +2372,7 @@ static int serve_loop(SaltGemma4Text *text_model,
         char client_request_sha256[G4_SHA256_HEX + 1] = {0};
         char request_sha256[G4_SHA256_HEX + 1] = {0};
         size_t prompt_bytes = 0, image_path_bytes = 0;
+        size_t proposal_history_count = 0;
         int expected_position = -1;
         int prompt_count, position_before, output_count = 0, stop_token = -1;
         int decode_source_position = -1;
@@ -2336,6 +2382,7 @@ static int serve_loop(SaltGemma4Text *text_model,
         int request_proof_state = 0;
         int request_tool_mode = 0;
         int request_input_mode = 0;
+        int proposal_history_invalid = 0;
         int input_prefix = 0, recycle_journal = 0;
         int prefill_count = 0;
         int history_expanded = 0, scheduler_rc;
@@ -2648,7 +2695,8 @@ static int serve_loop(SaltGemma4Text *text_model,
         if (parse_turn_header(header, &request_id, &expected_epoch,
                 &expected_turn, &expected_history_turns, &expected_position,
                 client_request_sha256, request_sha256,
-                &prompt_bytes, &image_path_bytes, &request_output_limit,
+                &prompt_bytes, &image_path_bytes, &proposal_history_count,
+                &request_output_limit,
                 &request_proof_state, &request_sampler_abi,
                 &request_temperature_bits, &request_sampler_seed,
                 &request_sampler_top_k, &request_logit_top_k,
@@ -2674,12 +2722,27 @@ static int serve_loop(SaltGemma4Text *text_model,
         g_sampler_draw_count = 0;
         if (read_exact(stdin, prompt, prompt_bytes) != 0 ||
             read_exact(stdin, image_path, image_path_bytes) != 0 ||
+            read_exact(stdin, proposal_history_wire,
+                       proposal_history_count * sizeof(uint32_t)) != 0 ||
             fgetc(stdin) != '\n') {
-            fputs("gemma4 persistent server: truncated TURN_V2 frame\n", stderr);
+            fputs("gemma4 persistent server: truncated TURN frame\n", stderr);
             goto done;
         }
         prompt[prompt_bytes] = '\0';
         image_path[image_path_bytes] = '\0';
+        for (size_t i = 0; i < proposal_history_count; i++) {
+            const unsigned char *wire = proposal_history_wire + i * 4u;
+            uint32_t token = (uint32_t)wire[0] |
+                ((uint32_t)wire[1] << 8u) |
+                ((uint32_t)wire[2] << 16u) |
+                ((uint32_t)wire[3] << 24u);
+            if (token > INT_MAX) {
+                fputs("gemma4 persistent server: invalid proposal history token\n",
+                      stderr);
+                goto done;
+            }
+            proposal_history_ids[i] = (int)token;
+        }
         expected_request++;
         {
             G4CommitRecord *record = find_record(
@@ -2705,6 +2768,12 @@ static int serve_loop(SaltGemma4Text *text_model,
         if (request_logit_top_k && g_dpr_mode != SALT_DPR_OFF) {
             if (emit_reject(request_id, "logits_dpr_unsupported",
                     "token-logit output is not qualified with DPR") != 0)
+                goto done;
+            continue;
+        }
+        if (request_logit_top_k && proposal_history_count != 0u) {
+            if (emit_reject(request_id, "v6_controls",
+                    "token-logit output and proposal history are mutually exclusive") != 0)
                 goto done;
             continue;
         }
@@ -2747,6 +2816,27 @@ static int serve_loop(SaltGemma4Text *text_model,
             if (emit_reject(request_id, "context_limit",
                     "persistent session configured context/output limit exceeded; "
                     "factual clear or reset required") != 0)
+                goto done;
+            continue;
+        }
+        if ((request_input_mode && proposal_history_count != 0u) ||
+            proposal_history_count > (size_t)(position_before - g_mindset_end) ||
+            proposal_history_count + (size_t)prompt_count > (size_t)g_context) {
+            if (emit_reject(request_id, "proposal_history",
+                    "proposal history is inconsistent with live session state") != 0)
+                goto done;
+            continue;
+        }
+        for (size_t i = 0; i < proposal_history_count; i++) {
+            if (proposal_history_ids[i] >=
+                    salt_gemma4_text_vocab_size(text_model)) {
+                proposal_history_invalid = 1;
+                break;
+            }
+        }
+        if (proposal_history_invalid) {
+            if (emit_reject(request_id, "proposal_history",
+                    "proposal history contains an invalid token") != 0)
                 goto done;
             continue;
         }
@@ -2949,6 +3039,17 @@ static int serve_loop(SaltGemma4Text *text_model,
         }
         scheduler.request.history_ids = (const int32_t *)prompt_ids;
         scheduler.request.history_count = scheduler_history_count;
+        scheduler.request.proposal_history_ids = NULL;
+        scheduler.request.proposal_history_count = 0u;
+        if (proposal_history_count != 0u) {
+            memcpy(proposal_history_ids + proposal_history_count,
+                   prompt_ids + (history_expanded ? position_before : 0),
+                   (size_t)prompt_count * sizeof *prompt_ids);
+            scheduler.request.proposal_history_ids =
+                (const int32_t *)proposal_history_ids;
+            scheduler.request.proposal_history_count =
+                (uint32_t)(proposal_history_count + (size_t)prompt_count);
+        }
         scheduler.request.prior_kv_rows = (uint32_t)position_before;
         salt_gpu_text_note("PARENT_TRAJECTORY",
             (uint32_t)decode_source_position, scheduler_history_count);
@@ -3133,6 +3234,8 @@ done:
     free(logits);
     free(mm_types);
     free(output_ids);
+    free(proposal_history_wire);
+    free(proposal_history_ids);
     free(prompt_ids);
     free(image_path);
     free(prompt);

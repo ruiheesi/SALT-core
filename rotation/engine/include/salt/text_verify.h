@@ -1023,6 +1023,11 @@ typedef struct SaltTextScheduleRequest {
     /* Optional committed prompt/session tokens preceding output_ids. */
     const int32_t *history_ids;
     uint32_t history_count;
+    /* Optional longer committed token ledger used only by the verified
+     * history proposal source. It does not participate in the prior-KV gate.
+     * When absent, history_ids/history_count remain the proposal view. */
+    const int32_t *proposal_history_ids;
+    uint32_t proposal_history_count;
     /* Live-KV rows that existed before this request's PREFILL. Kept separate
      * from history_count because the borrowed proposal trajectory may include
      * those rows while admission still needs the pre-request boundary. */

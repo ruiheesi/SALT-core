@@ -330,8 +330,26 @@ weights and their licenses remain separate from this source release.
 st config                 # show the selected model and local readiness
 st config gemma           # select Gemma 4 26B-A4B
 st config liquid          # select Liquid LFM2.5-24B-A2B
+st setup                  # fully rehash Gemma after a copy/restore
 st restart                # replace the running backend with that model
 ```
+
+`st setup` establishes the authenticated Gemma baseline for the current
+machine and absolute model path. It reads and verifies the pinned source
+shards, expert pool, and runtime, then atomically publishes the local
+authentication receipt. Run it once after transferring or restoring the
+package, and whenever `st start` reports cached file identity drift.
+
+The Gemma profile uses the isolated Metal layer-rotation runtime rather than
+the legacy root `gemma4-server`. Build it once with:
+
+```bash
+bash rotation/build-server.sh
+```
+
+`st config gemma` reports the selected rotation runner and configuration.
+The runtime reads `rotation/engine.config` at startup; its `native_target_x`
+value is authoritative for `st start -x N`.
 
 The Liquid profile expects the authenticated package described in
 `models/lfm2-24b-a2b/README.md` and a Metal runner built with:
